@@ -9,7 +9,7 @@
 > [!WARNING]
 > This project is designed for a full Docker environment. Run all services together (`db`, `redis`, `ollama`, `backend`, `celery_worker`, `frontend`) to avoid runtime failures.
 
-> [!INFO]
+> [!NOTE]
 > This project was made for DAP391 course (AI1905) - Spring 2026, FPT University
 
 ## ✨ Overview
@@ -26,7 +26,10 @@ HypeStock allows users to browse through live stock data computed by our systems
 - Internet connection (for pulling Docker images and AI models)
 - Optional: `GEMINI_API_KEY` for cloud AI provider mode
 
-## 📦 Build
+## 📦 Building
+
+> [!WARNING]
+> Before building, please **extract** the default sample data included in the `Data` folder
 
 Build all containers from the project root:
 
