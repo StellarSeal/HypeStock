@@ -1,0 +1,16 @@
+aiohttp==3.9.3
+python-socketio==5.11.1
+pandas==2.2.0
+requests==2.31.0
+google-genai==0.3.0
+pandasai==2.0.21
+fastapi==0.109.2
+uvicorn==0.27.1
+pydantic==2.6.1
+celery==5.3.6
+redis==5.0.1
+asyncpg==0.29.0
+sqlalchemy==2.0.47
+psycopg2-binary==2.9.11
+pyyaml==6.0.3
+google-generativeai==0.8.6

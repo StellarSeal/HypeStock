@@ -1,107 +1,77 @@
-# --- DATASET SERVICE MODULE ---
-# Handles CSV parsing, metadata aggregation, and pagination.
-import os
-import csv
-import random
+from sqlalchemy import text
+import pandas as pd
+import numpy as np
+from database import AsyncSessionLocal
 
-# In-memory storage for metadata
-STOCK_METADATA = []
-IS_LOADED = False
-
-# Paths
-COMPANIES_PATH = 'companies.csv'
-PRICES_PATH = 'stock_prices.csv'
-
-def generate_mock_data():
-    """Generates mock data if CSVs are missing."""
-    print("[DATA] CSV files not found. Generating mock data...")
-    mock_stocks = []
-    sectors = ['Tech', 'Finance', 'Health', 'Energy']
-    
-    for i in range(150):
-        # Generate code: AA + A-Z
-        code = f"{chr(65 + (i // 26))}{chr(65 + (i % 26))}{chr(65 + random.randint(0, 25))}"
+# Rule 1: No Global DataFrames. Queries are executed async.
+async def get_stocks(page: int, limit: int, query: str):
+    """Async Postgres query for stocks with pagination."""
+    async with AsyncSessionLocal() as session:
+        search_term = f"%{query}%"
         
-        mock_stocks.append({
-            "stock_code": code,
-            "company_name": f"Mock Company {code}",
-            "sector": random.choice(sectors),
-            "start_date": "2020-01-01",
-            "end_date": "2024-02-14",
-            "entry_count": random.randint(500, 5500)
-        })
-    
-    # Sort by stock_code
-    mock_stocks.sort(key=lambda x: x['stock_code'])
-    return mock_stocks
-
-def load_datasets():
-    """Loads and aggregates data from CSVs."""
-    global STOCK_METADATA, IS_LOADED
-    
-    if IS_LOADED:
-        return
-
-    if not os.path.exists(COMPANIES_PATH):
-        STOCK_METADATA = generate_mock_data()
-        IS_LOADED = True
-        return
-
-    print("[DATA] Loading datasets...")
-    companies = {}
-
-    try:
-        # 1. Load Companies
-        with open(COMPANIES_PATH, mode='r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                # Normalize keys just in case
-                code = row.get('stock_code') or row.get('Stock Code')
-                name = row.get('company_name') or row.get('Company Name')
-                if code:
-                    companies[code] = name or "Unknown Company"
-
-        # 2. Aggregate (Mocked aggregation for performance/missing price file)
-        temp_list = []
-        for code, name in companies.items():
-            temp_list.append({
-                "stock_code": code,
-                "company_name": name,
-                "start_date": "2021-01-01", 
-                "end_date": "2023-12-31",
-                "entry_count": random.randint(100, 1000)
-            })
+        sql = text("""
+            SELECT c.stock_code, c.company_name,
+                   MIN(p.time) as start_date,
+                   MAX(p.time) as end_date,
+                   COUNT(p.time) as entry_count
+            FROM companies c
+            LEFT JOIN stock_prices p ON c.stock_code = p.symbol
+            WHERE c.stock_code ILIKE :search OR c.company_name ILIKE :search
+            GROUP BY c.stock_code, c.company_name
+            ORDER BY c.stock_code
+            LIMIT :limit OFFSET :offset
+        """)
         
-        # Sort alphabetically
-        temp_list.sort(key=lambda x: x['stock_code'])
-        STOCK_METADATA = temp_list
-        print(f"[DATA] Loaded {len(STOCK_METADATA)} stocks.")
-        IS_LOADED = True
+        result = await session.execute(sql, {"search": search_term, "limit": limit, "offset": page * limit})
+        rows = result.fetchall()
 
-    except Exception as e:
-        print(f"[ERROR] Failed to load datasets: {e}")
-        STOCK_METADATA = generate_mock_data()
-        IS_LOADED = True
+        # Count total for pagination meta
+        count_sql = text("SELECT COUNT(*) FROM companies WHERE stock_code ILIKE :search OR company_name ILIKE :search")
+        total = (await session.execute(count_sql, {"search": search_term})).scalar()
 
-def get_stocks(page=0, limit=20, query=""):
-    """Returns paginated stock list."""
-    results = STOCK_METADATA
+        items = [{
+            "stock_code": r.stock_code,
+            "company_name": r.company_name,
+            "start_date": r.start_date.strftime('%Y-%m-%d') if r.start_date else None,
+            "end_date": r.end_date.strftime('%Y-%m-%d') if r.end_date else None,
+            "entry_count": r.entry_count
+        } for r in rows]
+
+        return {
+            "items": items,
+            "total": total,
+            "hasMore": (page * limit + limit) < total
+        }
+
+async def get_on_demand_indicators(symbol: str):
+    """Rule 4: Fetch raw OHLCV, compute metrics, return JSON safe dict."""
+    async with AsyncSessionLocal() as session:
+        # Fetch OHLCV data into temporary memory
+        sql = text("SELECT time, symbol, open, high, low, close, volume FROM stock_prices WHERE symbol = :sym ORDER BY time ASC")
+        result = await session.execute(sql, {"sym": symbol})
+        rows = result.fetchall()
+
+    if not rows:
+        return []
+
+    # 1. Create temporary DataFrame
+    df = pd.DataFrame(rows, columns=['time', 'symbol', 'open', 'high', 'low', 'close', 'volume'])
     
-    # Filter
-    if query:
-        q = query.lower()
-        results = [
-            s for s in results 
-            if q in s['stock_code'].lower() or q in s['company_name'].lower()
-        ]
-    
-    # Pagination
-    start_index = page * limit
-    end_index = start_index + limit
-    paginated_items = results[start_index:end_index]
-    
-    return {
-        "items": paginated_items,
-        "total": len(results),
-        "hasMore": end_index < len(results)
-    }
+    # Ensure numerics
+    num_cols = ['open', 'high', 'low', 'close', 'volume']
+    for col in num_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # 2. Run mathematical indicators via metrics.py
+    from metrics import calculate_indicators
+    df_metrics = calculate_indicators(df)
+
+    # 3. Rule 4: Clean output - Convert NaN / Inf to None for JSON compliance
+    # Prevent db storage by directly returning it
+    df_metrics = df_metrics.replace([np.inf, -np.inf], np.nan)
+    df_metrics = df_metrics.astype(object).where(pd.notnull(df_metrics), None)
+
+    # Convert timestamps back to string
+    df_metrics['time'] = df_metrics['time'].dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    return df_metrics.to_dict(orient='records')

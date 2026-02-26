@@ -1,0 +1,95 @@
+services:
+  # 1. PostgreSQL (TimescaleDB) - The consolidated data layer
+  db:
+    image: timescale/timescaledb-ha:pg16
+    container_name: hypestock-db
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: hypestock_password_idk
+      POSTGRES_DB: stock_data
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # 2. Redis - Caching and Celery Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: hypestock-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  # 3. Ollama - Local LLM Engine (GPU Enabled)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: hypestock-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    # Starts the server in the background, waits for initialization, pulls the model, and keeps the container alive
+    entrypoint: /bin/bash -c "ollama serve & sleep 5 && ollama pull deepseek-r1:7b && wait"
+    restart: unless-stopped
+
+  # 4. Python Backend (Socket.IO Server)
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hypestock-backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+      - ollama
+    environment:
+      # Now pointing to the internal docker-compose ollama service
+      - OLLAMA_URL=http://ollama:11434/api/chat
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - REDIS_URL=redis://redis:6379/0
+    restart: unless-stopped
+
+  # 5. Celery Worker - For asynchronous AI processing (Phase 4 of blueprint)
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hypestock-worker
+    # Command overrides the default CMD in the Dockerfile to boot Celery instead
+    command: celery -A ai_agent.celery_app worker --loglevel=info
+    depends_on:
+      - db
+      - redis
+      - ollama
+    environment:
+      - OLLAMA_URL=http://ollama:11434/api/chat
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - REDIS_URL=redis://redis:6379/0
+    restart: unless-stopped
+
+  # 6. Frontend UI - Served cleanly via Nginx
+  frontend:
+    image: nginx:alpine
+    container_name: hypestock-frontend
+    ports:
+      - "80:80" # Access the UI at http://localhost
+    volumes:
+      # Maps your Front-End-Main folder directly to Nginx's hosting directory
+      - ./Front-End-Main:/usr/share/nginx/html:ro
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  ollama_data:
