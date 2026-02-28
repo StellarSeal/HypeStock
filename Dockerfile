@@ -36,23 +36,38 @@ RUN find /app -maxdepth 1 -name "*.tar" -exec tar -xf {} -C /app \; -exec rm -f 
 RUN cat <<'EOF' > /app/entrypoint.sh
 #!/bin/bash
 echo "Waiting for PostgreSQL to start..."
-until psql -h db -U admin -d stock_data -c '\q' 2>/dev/null; do
+export PGPASSWORD="$PGPASSWORD"
+until pg_isready -h db -U admin -d stock_data 2>/dev/null; do
+  echo "PostgreSQL not ready yet, retrying in 2s..."
   sleep 2
 done
 
-echo "Creating tables..."
-psql -h db -U admin -d stock_data -c "CREATE TABLE IF NOT EXISTS companies (stock_code VARCHAR(50), company_name VARCHAR(255));"
-psql -h db -U admin -d stock_data -c "CREATE TABLE IF NOT EXISTS stock_prices (time TIMESTAMP, symbol VARCHAR(50), open FLOAT, high FLOAT, low FLOAT, close FLOAT, volume BIGINT);"
+# FIX: Check if the command is starting the main backend (uvicorn)
+# This prevents the celery worker from simultaneously triggering a database wipe/import
+if [ "$1" = "uvicorn" ]; then
+    echo "Cleaning old build data"
+    psql -h db -U admin -d stock_data -c "DROP TABLE IF EXISTS companies"
+    psql -h db -U admin -d stock_data -c "DROP TABLE IF EXISTS stock_prices"
+    psql -h db -U admin -d stock_data -c "DROP TABLE IF EXISTS metrics"
 
-echo "Clearing old data to prevent duplicates..."
-psql -h db -U admin -d stock_data -c "TRUNCATE TABLE companies, stock_prices;"
+    echo "Creating tables..."
+    psql -h db -U admin -d stock_data -c "CREATE TABLE IF NOT EXISTS companies (stock_code VARCHAR(50), company_name VARCHAR(255));"
+    psql -h db -U admin -d stock_data -c "CREATE TABLE IF NOT EXISTS stock_prices (time TIMESTAMP, symbol VARCHAR(50), open FLOAT, high FLOAT, low FLOAT, close FLOAT, volume BIGINT);"
+    psql -h db -U admin -d stock_data -c "CREATE TABLE IF NOT EXISTS metrics (\"time\" DATE, symbol VARCHAR(50), open DOUBLE PRECISION, high DOUBLE PRECISION, low DOUBLE PRECISION, close DOUBLE PRECISION, volume BIGINT, MA20 DOUBLE PRECISION, MA50 DOUBLE PRECISION, EMA20 DOUBLE PRECISION, RSI DOUBLE PRECISION, MACD DOUBLE PRECISION, Rolling_Vol_20d_std DOUBLE PRECISION, ATR DOUBLE PRECISION, Volume_MA20 DOUBLE PRECISION, Volume_Change_pct DOUBLE PRECISION, Daily_Return_1d DOUBLE PRECISION, Daily_Return_5d DOUBLE PRECISION, Cumulative_Return DOUBLE PRECISION, Daily_Range DOUBLE PRECISION, Vol_Close_Corr_20d DOUBLE PRECISION, BB_Width DOUBLE PRECISION, ADX DOUBLE PRECISION, OBV_Slope_5d DOUBLE PRECISION, Lagged_Return_t1 DOUBLE PRECISION, Lagged_Return_t3 DOUBLE PRECISION, Lagged_Return_t5 DOUBLE PRECISION, Dist_from_MA50 DOUBLE PRECISION);"
 
-echo "Importing CSV data..."
-# \copy is a psql meta-command and does not require a trailing semicolon
-psql -h db -U admin -d stock_data -c "\copy companies FROM '/app/companies.csv' DELIMITER ',' CSV HEADER"
-psql -h db -U admin -d stock_data -c "\copy stock_prices FROM '/app/stock_prices.csv' DELIMITER ',' CSV HEADER"
+    echo "Clearing old data to prevent duplicates..."
+    psql -h db -U admin -d stock_data -c "TRUNCATE TABLE companies, stock_prices, metrics;"
 
-echo "Starting server..."
+    echo "Importing CSV data..."
+    # \copy is a psql meta-command and does not require a trailing semicolon
+    psql -h db -U admin -d stock_data -c "\copy companies FROM '/app/companies.csv' DELIMITER ',' CSV HEADER"
+    psql -h db -U admin -d stock_data -c "\copy stock_prices FROM '/app/stock_prices.csv' DELIMITER ',' CSV HEADER"
+    psql -h db -U admin -d stock_data -c "\copy metrics FROM '/app/metrics.csv' DELIMITER ',' CSV HEADER"
+else
+    echo "Skipping database population for worker process..."
+fi
+
+echo "Starting server process: $1..."
 # exec "$@" ensures that the CMD passed by docker-compose (like Celery or Uvicorn) takes over process ID 1
 exec "$@"
 EOF

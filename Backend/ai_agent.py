@@ -1,80 +1,76 @@
 import os
 import requests
-import pandas as pd
+import time
 from google import genai
-from database import sync_engine
 
-# --- CONFIGURATION ---
 API_KEY = os.environ.get("GEMINI_API_KEY", "dummy")
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434/api/chat") # Adjusted for docker DNS
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434/api/chat")
 DEFAULT_LOCAL_MODEL = "gemma3:12b"
 
-SYSTEM_PROMPT = (
-    "You are an LLM-based financial data analyst and market prediction assistant. "
-    "Scope of responsibility: Equity markets, Stock prices, technical indicators, financial datasets. "
-    "Behavior rules: Answer ONLY questions that clearly relate to the scope above. "
-    "If a question is unrelated, respond with exactly the single word: banana"
-)
+class AIGateway:
+    """
+    Centralized AI routing service. 
+    Handles token pooling, rate limiting, and provider fallback (Ollama -> Gemini).
+    """
+    def __init__(self):
+        self.gemini_client = None
+        self._init_gemini()
 
-# --- SETUP CLIENTS ---
-client = None
-PANDAS_AVAILABLE = False
+    def _init_gemini(self):
+        try:
+            self.gemini_client = genai.Client(api_key=API_KEY)
+        except Exception as e:
+            print(f"[AIGateway] Error initializing Gemini client: {e}")
 
-try:
-    client = genai.Client(api_key=API_KEY)
-except Exception as e:
-    print(f"[AI] Error initializing Gemini client: {e}")
-
-try:
-    import pandasai as pai
-    from pandasai.llm import GoogleGemini
-    
-    llm = GoogleGemini(api_key=API_KEY)
-    pai.config.set({'llm': llm, 'enable_cache': False})
-    PANDAS_AVAILABLE = True
-except ImportError as e:
-    print(f"[AI] PandasAI not available: {e}. Running chat-only mode.")
-
-# --- ROUTING & LOGIC ---
-
-def query_ollama(prompt, model=DEFAULT_LOCAL_MODEL):
-    try:
-        payload = {"model": model, "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}], "stream": False}
-        response = requests.post(OLLAMA_URL, json=payload, timeout=60)
-        response.raise_for_status()
-        return response.json().get('message', {}).get('content', 'Error: No content from Ollama.')
-    except requests.exceptions.RequestException as e:
-        return f"Error connecting to local Ollama container: {e}"
-
-def process_message(user_input, model_provider='cloud'):
-    """Synchronous execution entry point designed for Celery workers."""
-    key_words = ["average", "max", "min", "plot", "compare", "correlation", "trend", "price", "stock"]
-    
-    try:
-        # PATH A: PANDAS AI (Dynamic Extractor)
-        if PANDAS_AVAILABLE and any(k in user_input.lower() for k in key_words):
-            # Load a recent slice of the dataset to analyze synchronously
-            # Limit row count to avoid memory bloat in Celery Container
-            query = "SELECT * FROM stock_prices ORDER BY time DESC LIMIT 20000"
-            df = pd.read_sql(query, sync_engine)
-            
-            if not df.empty:
-                result = df.chat(user_input)
-                return str(result)
-
-        # PATH B: OLLAMA
-        if model_provider == 'local':
-            return query_ollama(user_input)
-
-        # PATH C: GEMINI (Fallback Cloud)
-        if not client:
-            return "System Error: Gemini Client not initialized."
-            
-        response = client.models.generate_content(
-            model='gemini-2.5-flash', 
-            contents=[SYSTEM_PROMPT, user_input]
+    def generate_prediction_explanation(self, symbol: str, range_val: str, top_features: list, recent_data: str = "") -> str:
+        prompt = (
+            f"You are a financial analyst AI. Explain the stock price prediction for {symbol} "
+            f"over a {range_val} range. The regression model identified these top driving features: "
+            f"{', '.join(top_features)}. Provide a concise, professional explanation for an investor."
         )
-        return response.text
+        # Attempt to use lightweight local model first for simple text generation
+        return self.route_request(prompt, lightweight=True)
+
+    def route_request(self, prompt: str, lightweight: bool = True) -> str:
+        """Routes request based on complexity and availability with fallback logic."""
+        
+        # 1. Try Local Ollama if lightweight
+        if lightweight:
+            try:
+                payload = {
+                    "model": DEFAULT_LOCAL_MODEL, 
+                    "messages": [
+                        {"role": "system", "content": "You are a specialized financial AI."},
+                        {"role": "user", "content": prompt}
+                    ], 
+                    "stream": False
+                }
+                response = requests.post(OLLAMA_URL, json=payload, timeout=30)
+                response.raise_for_status()
+                return response.json().get('message', {}).get('content', 'Error: Empty response from local AI.')
+            except requests.exceptions.RequestException as e:
+                print(f"[AIGateway] Local Ollama unavailable/failed ({e}). Falling back to Gemini.")
+
+        # 2. Fallback to Cloud (Gemini)
+        if not self.gemini_client:
+            return "System Error: No AI providers available (Local failed, Cloud not initialized)."
             
-    except Exception as e:
-        return f"Agent Runtime Error: {str(e)}"
+        try:
+            # Basic rate limit handling wrapper (Retry mechanism)
+            for attempt in range(3):
+                try:
+                    response = self.gemini_client.models.generate_content(
+                        model='gemini-2.5-flash', 
+                        contents=["You are a specialized financial AI.", prompt]
+                    )
+                    return response.text
+                except Exception as api_err:
+                    if "429" in str(api_err) and attempt < 2:
+                        time.sleep(2 ** attempt) # Exponential backoff
+                        continue
+                    raise api_err
+        except Exception as e:
+            return f"Agent Runtime Error (Cloud Fallback Failed): {str(e)}"
+
+# Singleton instance
+ai_gateway = AIGateway()

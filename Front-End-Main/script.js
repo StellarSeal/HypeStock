@@ -1,12 +1,13 @@
 // --- 1. STATE & CONFIG ---
 let currentTabIndex = 0;
 let isFocusMode = false;
-const tabs = ['overview', 'stocks', 'chat'];
+// Expanded tabs to accommodate the new Stock Detail view
+const tabs = ['overview', 'stocks', 'detail', 'chat'];
 const pageTrack = document.getElementById('page-track');
 
 // Stock Pagination State
 let stockPage = 0;
-let stockLimit = 24; // Multiples of 1, 2, 3, 4 columns for a neat grid
+let stockLimit = 24; 
 let isLoadingStocks = false;
 let hasMoreStocks = true;
 let stockSearchQuery = "";
@@ -19,6 +20,11 @@ let lenis = null;
 // Startup State
 let isAnimationDone = false;
 let isBackendReady = false;
+
+// Generate a random request_id to satisfy Pydantic validations
+function generateReqId() {
+    return 'req_' + Math.random().toString(36).substring(2, 10);
+}
 
 // --- SETUP MARKED.JS ---
 if (typeof marked !== 'undefined') {
@@ -53,12 +59,23 @@ function initSocket() {
             console.log("✅ Socket Connected");
             updateConnectionStatus(true);
             showToast("Connected to Backend");
-            socket.emit('startup', { timestamp: Date.now() });
+            
+            socket.emit('startup', { 
+                timestamp: Date.now(),
+                request_id: generateReqId()
+            });
         });
 
         socket.on('disconnect', () => {
             console.warn("❌ Socket Disconnected");
             updateConnectionStatus(false);
+        });
+
+        socket.on('error', (envelope) => {
+            const data = envelope.payload || envelope;
+            console.error("❌ Backend Error:", data);
+            showToast(`Error: ${data.message || "Request failed"}`, "error");
+            isLoadingStocks = false;
         });
 
         socket.on('startup_response', (data) => {
@@ -93,9 +110,7 @@ function initLenis() {
     const content   = document.getElementById('content-wrapper');
     if (!container || !content || lenis) return;
 
-    // Dynamic padding to allow scrolling past the footer (25% of resolution height)
     const updatePadding = () => {
-        // Fix: Apply padding to the inner content wrapper so Lenis registers the height increase
         content.style.paddingBottom = `${window.innerHeight * 0.25}px`;
         if (lenis) lenis.resize();
     };
@@ -114,16 +129,13 @@ function initLenis() {
         touchMultiplier:    2,
     });
 
-    // Handle scroll events for dynamic UI (Search bar blur effect)
     lenis.on('scroll', (e) => {
         const searchContainer = document.getElementById('search-container');
         if (searchContainer) {
             if (e.scroll > 20) {
-                // Scrolled down: stick to top and apply glassmorphism
                 searchContainer.classList.add('bg-slate-950/80', 'backdrop-blur-md', 'border-b', 'border-slate-800', 'py-4', 'top-0');
                 searchContainer.classList.remove('top-6');
             } else {
-                // Top of page: return to floating appearance
                 searchContainer.classList.remove('bg-slate-950/80', 'backdrop-blur-md', 'border-b', 'border-slate-800', 'py-4', 'top-0');
                 searchContainer.classList.add('top-6');
             }
@@ -135,12 +147,6 @@ function initLenis() {
         requestAnimationFrame(raf);
     }
     requestAnimationFrame(raf);
-
-    // Auto-resize Lenis when content changes to prevent hidden/cut-off footers
-    const resizeObserver = new ResizeObserver(() => {
-        if (lenis) lenis.resize();
-    });
-    resizeObserver.observe(content);
 }
 
 // --- 4. PAGINATED DATA FETCHING ---
@@ -160,12 +166,10 @@ function fetchStocks(reset = false) {
         const list = document.getElementById('stock-list');
         const pagControls = document.getElementById('pagination-controls');
         
-        // Setup UI for Loading State
         if (loader) loader.classList.remove('hidden');
         if (pagControls) pagControls.classList.add('hidden');
-        if (list) list.innerHTML = ''; // Clear layout for fresh items
+        if (list) list.innerHTML = '';
 
-        // Safety Timeout
         clearTimeout(stockLoadTimeout);
         stockLoadTimeout = setTimeout(() => {
             if (isLoadingStocks) {
@@ -176,8 +180,8 @@ function fetchStocks(reset = false) {
             }
         }, 8000);
 
-        // Fetch request
         socket.emit('request_stocks', {
+            request_id: generateReqId(),
             page: stockPage,
             limit: stockLimit,
             query: stockSearchQuery
@@ -187,47 +191,47 @@ function fetchStocks(reset = false) {
     }
 }
 
-function handleStockData(data) {
+function handleStockData(envelope) {
     clearTimeout(stockLoadTimeout);
     const loader = document.getElementById('stock-loader');
     const list = document.getElementById('stock-list');
     
     isLoadingStocks = false;
     if(loader) loader.classList.add('hidden');
-    if(list) list.innerHTML = ''; 
+    if(list) list.innerHTML = '';
 
-    if (data.items) {
-        if (data.items.length === 0) {
-            list.innerHTML = `<div id="empty-msg" class="col-span-full text-center text-slate-500 py-10">No stocks found matching "${stockSearchQuery}".</div>`;
-            hasMoreStocks = false;
-            updatePaginationUI();
-            return;
-        }
+    const data = envelope.payload || envelope;
+    const itemsArray = data.items || (Array.isArray(data) ? data : []);
 
-        // Determine if we have a next page
-        hasMoreStocks = data.items.length >= stockLimit;
-
-        // Render Page Items
-        const fragment = document.createDocumentFragment();
-        data.items.forEach((stock, index) => {
-            const card = createStockCard(stock);
-            // Staggered fade in
-            card.style.animation = `fadeInUp 0.3s ease forwards ${index * 0.03}s`;
-            card.style.opacity = '0';
-            fragment.appendChild(card);
-        });
-        
-        list.appendChild(fragment);
+    if (itemsArray.length === 0) {
+        list.innerHTML = `<div id="empty-msg" class="col-span-full text-center text-slate-500 py-10">No stocks found matching "${stockSearchQuery}".</div>`;
+        hasMoreStocks = false;
         updatePaginationUI();
-        
-        // Reset scroll position gracefully using Lenis to prevent fighting native scroll
+        return;
+    }
+
+    hasMoreStocks = data.hasMore !== undefined ? data.hasMore : itemsArray.length >= stockLimit;
+
+    const fragment = document.createDocumentFragment();
+    itemsArray.forEach((stock, index) => {
+        const card = createStockCard(stock);
+        card.style.animation = `fadeInUp 0.3s ease forwards ${index * 0.03}s`;
+        card.style.opacity = '0';
+        fragment.appendChild(card);
+    });
+    
+    list.appendChild(fragment);
+    updatePaginationUI();
+    
+    requestAnimationFrame(() => {
         if (lenis) {
+            lenis.resize();
             lenis.scrollTo(0, { immediate: true });
         } else {
             const container = document.getElementById('stock-scroll-container');
             if (container) container.scrollTo({ top: 0, behavior: 'auto' });
         }
-    }
+    });
 }
 
 function updatePaginationUI() {
@@ -238,7 +242,6 @@ function updatePaginationUI() {
     
     if (!pagControls || !prevBtn || !nextBtn || !numbersContainer) return;
     
-    // Hide controls if absolutely no items and on first page
     const list = document.getElementById('stock-list');
     if (stockPage === 0 && !hasMoreStocks && (!list || list.children.length === 0 || list.querySelector('#empty-msg'))) {
         pagControls.classList.add('hidden');
@@ -249,11 +252,9 @@ function updatePaginationUI() {
     prevBtn.disabled = stockPage === 0;
     nextBtn.disabled = !hasMoreStocks;
     
-    // Render Numbered Page Buttons dynamically (show a window of up to 5 pages)
     let startPage = Math.max(0, stockPage - 2);
     let endPage = startPage + 4;
     
-    // Clamp the end based on whether there's more data to show
     if (!hasMoreStocks) {
         endPage = stockPage;
         startPage = Math.max(0, endPage - 4);
@@ -267,7 +268,6 @@ function updatePaginationUI() {
     }
     numbersContainer.innerHTML = html;
 
-    // Attach click events for direct page skipping
     numbersContainer.querySelectorAll('.page-num-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
             const targetPage = parseInt(e.target.getAttribute('data-page'));
@@ -278,7 +278,6 @@ function updatePaginationUI() {
         });
     });
 
-    // Update pill position slightly after rendering to let DOM calculate sizes
     setTimeout(updatePaginationPill, 10);
 }
 
@@ -301,26 +300,41 @@ function updatePaginationPill() {
 
 function createStockCard(stock) {
     const div = document.createElement('div');
-    div.className = 'stock-card h-[160px] flex flex-col justify-between group';
-    div.onclick = () => showToast(`Selected ${stock.stock_code}`, "info");
+    div.className = 'stock-card h-[160px] flex flex-col justify-between group cursor-pointer';
+    
+    const code = stock.stock_code || stock.symbol || "N/A";
+    const name = stock.company_name || stock.name || "Unknown Co.";
+    const start = stock.start_date || "--"; // Extract logic handled in backend
+    const end = stock.end_date || "--";
+    const count = stock.trading_days ? stock.trading_days.toLocaleString() : "0"; // Mapped from entries
+
+    div.onclick = () => {
+        showToast(`Loading data for ${code}...`, "info");
+        navigateTo('detail');
+        if (window.StockDetail) {
+            window.StockDetail.loadSymbol(code);
+        } else {
+            console.warn("StockDetail module not initialized.");
+        }
+    };
 
     div.innerHTML = `
         <div>
             <div class="flex justify-between items-start mb-2">
-                <span class="text-xl font-bold text-white tracking-tight">${stock.stock_code}</span>
+                <span class="text-xl font-bold text-white tracking-tight">${code}</span>
                 <span class="text-xs text-slate-500 font-mono bg-slate-900 px-2 py-1 rounded border border-slate-800">EQ</span>
             </div>
-            <h3 class="text-sm text-slate-300 font-medium leading-tight mb-4 line-clamp-2">${stock.company_name}</h3>
+            <h3 class="text-sm text-slate-300 font-medium leading-tight mb-4 line-clamp-2">${name}</h3>
         </div>
         
         <div class="space-y-2 border-t border-slate-700/50 pt-3">
             <div class="flex justify-between text-xs">
                 <span class="text-slate-500">Range</span>
-                <span class="text-slate-300 font-mono">${stock.start_date.substring(0,4)} → ${stock.end_date.substring(0,4)}</span>
+                <span class="text-slate-300 font-mono">${start} → ${end}</span>
             </div>
             <div class="flex justify-between text-xs">
-                <span class="text-slate-500">Entries</span>
-                <span class="text-sky-400 font-mono font-bold">${stock.entry_count.toLocaleString()}</span>
+                <span class="text-slate-500">Trading Days</span>
+                <span class="text-sky-400 font-mono font-bold">${count}</span>
             </div>
         </div>
     `;
@@ -336,7 +350,14 @@ function sendAIMessage(content) {
     }
     const seed = Math.floor(Math.random() * 2147483647);
     const modelSelect = document.getElementById('model-select');
-    const payload = { type: "ai", content: content, seed: seed, model: modelSelect ? modelSelect.value : 'cloud' };
+    const payload = { 
+        request_id: generateReqId(),
+        type: "ai", 
+        content: content, 
+        seed: seed, 
+        model: modelSelect ? modelSelect.value : 'cloud' 
+    };
+    
     addMessage(content, true);
     showTypingIndicator();
     const timeoutId = setTimeout(() => {
@@ -362,7 +383,6 @@ function handleServerMessage(data) {
     }
 }
 
-// Chat UI Setup
 const chatInput = document.getElementById('chat-input');
 const chatBtn = document.getElementById('chat-btn');
 const chatMessages = document.getElementById('chat-messages');
@@ -417,13 +437,24 @@ if (chatBtn && chatInput) {
     });
 }
 
-
 // --- 6. EVENT LISTENERS & NAVIGATION ---
 window.addEventListener('load', () => {
+    // Force dismiss after 5 seconds to prevent permanent locking
+    setTimeout(() => {
+        if (!isBackendReady) {
+            console.warn("Backend connection timed out. Forcing UI unlock.");
+            isBackendReady = true; 
+            tryDismissIntro();
+        }
+    }, 5000);
     initSocket();
     initLenis();
+    
+    // Initialize the separated Module Logic
+    if (window.StockDetail) {
+        window.StockDetail.init();
+    }
 
-    // Intro Overlay Animation
     const introProgress = document.getElementById('intro-progress');
     const dots = document.querySelectorAll('.intro-dot');
 
@@ -444,12 +475,10 @@ window.addEventListener('load', () => {
     }
     updateNavPill();
     
-    // Re-adjust pill width and position if the screen is resized
     window.addEventListener('resize', () => {
         updatePaginationPill();
     });
     
-    // Pagination Listeners
     document.getElementById('prev-page-btn')?.addEventListener('click', () => {
         if (stockPage > 0) {
             stockPage--;
@@ -533,7 +562,7 @@ if (searchInput) {
         debounceTimer = setTimeout(() => {
             if (query.length > 0 || (query.length === 0 && stockSearchQuery.length > 0)) {
                 stockSearchQuery = query;
-                fetchStocks(true); // Reset to page 0 on new search
+                fetchStocks(true);
             }
         }, 300);
     });
