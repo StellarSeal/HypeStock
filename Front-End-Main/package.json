@@ -1,0 +1,13 @@
+{
+  "name": "hypestock-frontend",
+  "version": "1.0.0",
+  "description": "Production build pipeline for HypeStock Frontend",
+  "scripts": {
+    "build": "node build.js"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "esbuild": "^0.20.1",
+    "javascript-obfuscator": "^4.1.0"
+  }
+}

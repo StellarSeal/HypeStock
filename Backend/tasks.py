@@ -1,58 +1,70 @@
 import os
-import json
-import time
 from celery import Celery
 import socketio
-import redis
-from models import build_envelope
 from ai_agent import ai_gateway
+from models import build_envelope
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+# --- CONFIGURATION ---
+# Target the updated Redis port schema for message brokering
+REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:16379/0")
 
-# Setup Celery Worker
-celery_app = Celery('ai_tasks', broker=REDIS_URL)
+# Initialize the Celery Application
+celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
 
-# Setup Sync RedisManager and standard redis client
-mgr = socketio.RedisManager(REDIS_URL)
-sync_redis = redis.Redis.from_url(REDIS_URL)
+# Initialize a synchronous Redis Manager. 
+# This allows our detached Celery workers to broadcast Socket.IO events 
+# through Redis, which the FastAPI ASGI server will pick up and send to clients.
+socket_manager = socketio.RedisManager(REDIS_URL)
 
-@celery_app.task
+@celery_app.task(name="tasks.process_ai_chat")
+def process_ai_chat(sid: str, request_id: str, content: str, seed: int, context: str):
+    """
+    Processes natural language queries asynchronously.
+    Offloads heavy LLM/PandasAI generation from the main event loop.
+    """
+    try:
+        response = ai_gateway.answer_chat_query(content, context)
+        
+        # The frontend script.js expects a payload with type="ai" and the specific seed
+        payload = {
+            "type": "ai",
+            "seed": seed,
+            "response": response
+        }
+        
+        envelope = build_envelope("ai_response", request_id, payload)
+        socket_manager.emit('ai_response', envelope, room=sid)
+        
+    except Exception as e:
+        error_envelope = build_envelope('error', request_id, {"code": 500, "message": f"AI Processing Error: {str(e)}"})
+        socket_manager.emit('error', error_envelope, room=sid)
+
+
+@celery_app.task(name="tasks.generate_prediction_explanation")
 def generate_prediction_explanation(sid: str, request_id: str, symbol: str, range_val: str, top_features: list):
     """
-    Background Task: Calls the AIGateway and emits result straight back to the socket.
+    Generates a financial explanation of the ML prediction features in the background.
     """
     try:
         explanation = ai_gateway.generate_prediction_explanation(symbol, range_val, top_features)
         
         payload = {
             "symbol": symbol,
-            "range": range_val,
-            "explanation_text": explanation
+            "explanation": explanation
         }
-        envelope = build_envelope("prediction_explanation_ready", request_id, payload)
-        mgr.emit('prediction_explanation_ready', envelope, room=sid)
-
+        
+        envelope = build_envelope("explain_result", request_id, payload)
+        socket_manager.emit('explain_result', envelope, room=sid)
+        
     except Exception as e:
-        print(f"[CELERY] Explanation Task Failed: {e}")
-        error_env = build_envelope("server_error", request_id, {"code": 500, "message": str(e)})
-        mgr.emit('server_error', error_env, room=sid)
+        error_envelope = build_envelope('error', request_id, {"code": 500, "message": f"Explanation Error: {str(e)}"})
+        socket_manager.emit('error', error_envelope, room=sid)
 
-@celery_app.task
-def compute_feature_importance(symbol: str, range_val: str):
+
+@celery_app.task(name="tasks.compute_feature_importance")
+def compute_feature_importance(*args, **kwargs):
     """
-    Background Task: Trains lightweight RandomForestRegressor and extracts importance.
-    Stores result in Redis for the REST endpoint to consume.
+    Placeholder task for long-running dataset permutations 
+    or recalculating feature importance matrices.
     """
-    # Mock ML process for the immediate frontend build
-    time.sleep(2) 
-    importance = {
-        "trend_strength": 0.45, 
-        "volume_surge": 0.30, 
-        "volatility": 0.25
-    }
-    
-    # Store directly into Redis cache
-    cache_key = f"importance:{symbol}:{range_val}"
-    sync_redis.setex(cache_key, 3600, json.dumps(importance)) # 1 hr TTL
-    
-    return importance
+    pass

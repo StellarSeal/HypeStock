@@ -39,6 +39,19 @@ class SummaryResponse(BaseModel):
     data_range: str
     metrics: MetricsResponse
 
+class PredictionPoint(BaseModel):
+    date: str
+    close: float
+
 class PredictionResponse(BaseModel):
     available: bool
     message: Optional[str] = "Model training in progress or not yet integrated."
+    trend: Optional[str] = None
+    confidence: Optional[float] = None
+    top_features: Optional[List[Dict[str, Any]]] = None
+    predictions: Optional[List[PredictionPoint]] = None
+
+class CompareRequest(BaseModel):
+    symbols: List[str] = Field(..., max_items=3, min_items=1)
+    default_metric: str = "close"
+    default_time_range: str = "1Y"

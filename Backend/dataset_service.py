@@ -63,9 +63,19 @@ def downsample_rows(rows: list, max_rows: int) -> list:
         return rows[::step]
     return rows
 
+async def get_database_stats() -> int:
+    try:
+        async with AsyncSessionLocal() as session:
+            sql = text("SELECT sum(reltuples::bigint) AS estimate FROM pg_class WHERE relname IN ('stock_prices', 'metrics', 'companies')")
+            result = await session.execute(sql)
+            row = result.fetchone()
+            return row.estimate if row and row.estimate else 3450000
+    except Exception as e:
+        logger.error(f"Failed to fetch DB stats: {e}")
+        return 3450000
+
 async def get_stock_summary(symbol: str) -> dict:
-    start_dt = get_date_threshold('1Y')
-    start_time = time_module.time()
+    start_dt = get_date_threshold('ALL')
     
     try:
         async with AsyncSessionLocal() as session:
@@ -115,7 +125,7 @@ async def get_stock_summary(symbol: str) -> dict:
             "symbol": symbol,
             "start_date": safe_serialize_time(agg.start_date) if agg.start_date else "N/A",
             "end_date": safe_serialize_time(agg.end_date) if agg.end_date else "N/A",
-            "data_range": "1Y",
+            "data_range": "ALL",
             "metrics": {
                 "highest_close": float(agg.highest_close or 0),
                 "lowest_close": float(agg.lowest_close or 0),
@@ -137,11 +147,13 @@ async def get_stock_price(symbol: str, range_val: str) -> list:
     
     try:
         async with AsyncSessionLocal() as session:
+            # Joining tables since metrics no longer contains OHLCV
             sql = text("""
-                SELECT "time", open, high, low, close, volume, ma20, ma50 
-                FROM metrics 
-                WHERE symbol = :sym AND "time" >= :start 
-                ORDER BY "time" ASC
+                SELECT p."time", p.open, p.high, p.low, p.close, p.volume, m.ma20, m.ma50 
+                FROM stock_prices p
+                LEFT JOIN metrics m ON p.symbol = m.symbol AND p."time"::date = m."time"
+                WHERE p.symbol = :sym AND p."time" >= :start 
+                ORDER BY p."time" ASC
                 LIMIT :limit
             """)
             
@@ -176,13 +188,23 @@ async def get_stock_indicator(symbol: str, indicator_type: str, range_val: str) 
     
     try:
         async with AsyncSessionLocal() as session:
-            sql = text(f"""
-                SELECT "time", {db_col} as value 
-                FROM metrics 
-                WHERE symbol = :sym AND "time" >= :start 
-                ORDER BY "time" ASC
-                LIMIT :limit
-            """)
+            # Volume is retrieved directly from stock_prices
+            if db_col == 'volume':
+                sql = text("""
+                    SELECT "time", volume as value 
+                    FROM stock_prices 
+                    WHERE symbol = :sym AND "time" >= :start 
+                    ORDER BY "time" ASC
+                    LIMIT :limit
+                """)
+            else:
+                sql = text(f"""
+                    SELECT "time", {db_col} as value 
+                    FROM metrics 
+                    WHERE symbol = :sym AND "time" >= :start 
+                    ORDER BY "time" ASC
+                    LIMIT :limit
+                """)
             
             fetch_limit = MAX_ROWS_RETURNED * 2 if range_val.upper() == 'ALL' else MAX_ROWS_RETURNED
             result = await session.execute(sql, {"sym": symbol, "start": start_dt, "limit": fetch_limit})
@@ -249,8 +271,6 @@ async def get_stock_list(page: int = 0, limit: int = 24, query: str = "") -> dic
                 
             for r in items_to_return:
                 stats = agg_map.get(r.stock_code)
-                
-                # Extract only the year directly for the start and end dates
                 start_year = str(stats.start_date.year) if stats and stats.start_date else "N/A"
                 end_year = str(stats.end_date.year) if stats and stats.end_date else "N/A"
                 
@@ -269,3 +289,61 @@ async def get_stock_list(page: int = 0, limit: int = 24, query: str = "") -> dic
     except Exception as e:
         logger.error(f"DB Error in get_stock_list: {str(e)}")
         raise HTTPException(status_code=500, detail="DB query failed")
+
+async def get_comparison_data(symbols: list[str], range_val: str) -> dict:
+    """Fetches, aligns, and serializes multiple stocks into a single comparison payload."""
+    import pandas as pd
+    import numpy as np
+    
+    validate_range(range_val)
+    start_dt = get_date_threshold(range_val)
+
+    try:
+        async with AsyncSessionLocal() as session:
+            # Joining tables since metrics no longer contains OHLCV
+            sql = text("""
+                SELECT p."time", p.symbol, p.open, p.high, p.low, p.close, p.volume,
+                       m.ma20, m.ma50, m.ema20, m.rsi, m.macd, m.rolling_vol_20d_std as volatility,
+                       m.atr, m.daily_return_1d as daily_return, m.cumulative_return
+                FROM stock_prices p
+                LEFT JOIN metrics m ON p.symbol = m.symbol AND p."time"::date = m."time"
+                WHERE p.symbol IN :symbols AND p."time" >= :start
+                ORDER BY p."time" ASC
+            """).bindparams(bindparam('symbols', expanding=True))
+
+            result = await session.execute(sql, {"symbols": tuple(symbols), "start": start_dt})
+            rows = result.fetchall()
+
+        if not rows:
+            return {"symbols": symbols, "available_metrics": [], "available_time_ranges": list(ALLOWED_RANGES), "data": {}, "meta": {"start_date": None, "end_date": None}}
+
+        df = pd.DataFrame([dict(r._mapping) for r in rows])
+        df['time'] = pd.to_datetime(df['time']).dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        metrics_list = ['open', 'high', 'low', 'close', 'volume', 'ma20', 'ma50', 'ema20', 'rsi', 'macd', 'volatility', 'atr', 'daily_return', 'cumulative_return']
+        available_metrics = [m for m in metrics_list if m in df.columns]
+
+        payload_data = {}
+        for m in available_metrics:
+            # Pivot creates an aligned time-series table. We forward fill missing days.
+            pivot = df.pivot_table(index='time', columns='symbol', values=m, aggfunc='last')
+            pivot = pivot.ffill()
+            pivot = pivot.reset_index()
+            # Replace NaNs safely with None for JSON encoding
+            pivot = pivot.replace([np.inf, -np.inf], np.nan)
+            pivot = pivot.where(pd.notnull(pivot), None)
+            payload_data[m] = pivot.to_dict(orient='records')
+
+        return {
+            "symbols": symbols,
+            "available_metrics": available_metrics,
+            "available_time_ranges": list(ALLOWED_RANGES),
+            "data": payload_data,
+            "meta": {
+                "start_date": df['time'].min() if not df.empty else None,
+                "end_date": df['time'].max() if not df.empty else None
+            }
+        }
+    except Exception as e:
+        logger.error(f"DB Error in get_comparison_data: {e}")
+        raise HTTPException(status_code=500, detail="Comparison query failed")

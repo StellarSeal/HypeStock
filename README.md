@@ -54,7 +54,8 @@ docker compose build
 	docker-compose up --build -d
 	```
 4. Open frontend at `http://localhost`.
-5. Backend health endpoint: `http://localhost:8000/`.
+5. Frontend gateway status endpoint: `http://localhost/system/status`.
+6. Direct backend status endpoint: `http://localhost:12000/system/status`.
 
 To stop:
 

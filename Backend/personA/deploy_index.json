@@ -1,0 +1,32 @@
+[
+  {
+    "task": "price_direction_clf",
+    "path": "deploy_artifacts_personA_v2/price_direction_clf.joblib",
+    "type": "clf"
+  },
+  {
+    "task": "break_resistance_1_5d_clf",
+    "path": "deploy_artifacts_personA_v2/break_resistance_1_5d_clf.joblib",
+    "type": "clf"
+  },
+  {
+    "task": "break_support_1_5d_clf",
+    "path": "deploy_artifacts_personA_v2/break_support_1_5d_clf.joblib",
+    "type": "clf"
+  },
+  {
+    "task": "next_day_return_reg",
+    "path": "deploy_artifacts_personA_v2/next_day_return_reg.joblib",
+    "type": "reg"
+  },
+  {
+    "task": "next_week_mean_close_5d_reg",
+    "path": "deploy_artifacts_personA_v2/next_week_mean_close_5d_reg.joblib",
+    "type": "reg"
+  },
+  {
+    "task": "trend_duration_tte_reg",
+    "path": "deploy_artifacts_personA_v2/trend_duration_tte_reg.joblib",
+    "type": "reg"
+  }
+]
