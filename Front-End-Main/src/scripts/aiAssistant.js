@@ -4,6 +4,7 @@
 window.AIAssistant = {
     lastDetailSymbol: null,
     lastCompareHash: null,
+    popupTimeout: null,
 
     init() {
         // Poll loosely to intercept fully loaded datasets dynamically without risking race conditions
@@ -22,16 +23,20 @@ window.AIAssistant = {
     },
 
     checkDetailState() {
-        if (window.currentTabIndex !== 2) return; 
+        // Check active tab via DOM since window.currentTabIndex is isolated in the IIFE bundle
+        const detailBtn = document.querySelector('.tab-btn[data-target="detail"]');
+        if (!detailBtn || !detailBtn.classList.contains('text-white')) return; 
         
         const cache = window.StockCache;
         if (!cache || !cache.currentSymbol || !cache.summary) return;
 
         // Ensure price arrays are successfully hydrated
-        if (cache.prices && cache.prices['1M'] && cache.prices['1M'].length > 0) {
+        const currentRange = window.StockDetail && window.StockDetail.range ? window.StockDetail.range : 'ALL';
+
+        if (cache.prices && cache.prices[currentRange] && cache.prices[currentRange].length > 0) {
             if (this.lastDetailSymbol !== cache.currentSymbol) {
                 this.lastDetailSymbol = cache.currentSymbol;
-                const latestClose = cache.prices['1M'][cache.prices['1M'].length - 1].close;
+                const latestClose = cache.prices[currentRange][cache.prices[currentRange].length - 1].close;
                 
                 const cacheKey = this.getDetailCacheKey(cache.currentSymbol, latestClose);
 
@@ -47,11 +52,13 @@ window.AIAssistant = {
     },
 
     checkCompareState() {
-        if (window.currentTabIndex !== 3) return; 
+        // Check active tab via DOM since window.currentTabIndex is isolated in the IIFE bundle
+        const compareBtn = document.querySelector('.tab-btn[data-target="compare"]');
+        if (!compareBtn || !compareBtn.classList.contains('text-white')) return;
 
         const store = window.CompareStore;
         if (!store || !store.symbols || store.symbols.length < 2) return;
-        if (!store.dataCache || !store.dataCache.data || !store.dataCache.data['close']) return;
+        if (!store.dataCache || !store.dataCache.data) return;
 
         const currentHash = store.symbols.slice().sort().join(',');
         if (this.lastCompareHash !== currentHash) {
@@ -71,157 +78,85 @@ window.AIAssistant = {
         const popup = document.getElementById('ai-assistant-popup');
         if (!popup) return;
 
-        // Inject the bot.jpg asset dynamically
-        const avatarContainer = popup.querySelector('.w-10.h-10');
-        if (avatarContainer && !avatarContainer.querySelector('img')) {
-            avatarContainer.innerHTML = '<img src="../assets/bot.jpg" class="w-full h-full object-cover rounded-full shadow-[0_0_10px_rgba(168,85,247,0.4)]" alt="Hypo AI">';
-            avatarContainer.classList.remove('bg-purple-500/20', 'border');
+        console.log(`[AIAssistant] Queuing popup for ${mode} analysis. Waiting 3 seconds...`);
+
+        // Clear any existing pending popups to prevent overlap if user switches fast
+        if (this.popupTimeout) {
+            clearTimeout(this.popupTimeout);
         }
 
-        const textElem = popup.querySelector('p');
-        const btnYes = document.getElementById('ai-popup-yes');
-        const btnNo = document.getElementById('ai-popup-no');
-        
-        // Clear UI boxes initially
-        if (mode === 'detail') document.getElementById('sd-ai-analysis-container').classList.add('hidden');
-        if (mode === 'compare') document.getElementById('compare-ai-analysis-container').classList.add('hidden');
+        this.popupTimeout = setTimeout(() => {
+            console.log(`[AIAssistant] 3 seconds passed. Displaying popup for ${mode} analysis now.`);
 
-        textElem.innerText = mode === 'detail' 
-            ? `Would you like AI assistance analyzing this stock?`
-            : `Would you like AI to rank these compared stocks?`;
+            // Inject the bot.jpg asset dynamically
+            const avatarContainer = popup.querySelector('.w-10.h-10');
+            if (avatarContainer && !avatarContainer.querySelector('img')) {
+                avatarContainer.innerHTML = '<img src="../assets/bot.jpg" class="w-full h-full object-cover rounded-full shadow-[0_0_10px_rgba(168,85,247,0.4)]" alt="Hypo AI">';
+                avatarContainer.classList.remove('bg-purple-500/20', 'border');
+            }
 
-        popup.classList.remove('translate-y-[150%]');
+            const textElem = popup.querySelector('p');
+            const btnYes = document.getElementById('ai-popup-yes');
+            const btnNo = document.getElementById('ai-popup-no');
 
-        // Clear existing event listeners to prevent cross-contamination
-        const newBtnYes = btnYes.cloneNode(true);
-        const newBtnNo = btnNo.cloneNode(true);
-        btnYes.replaceWith(newBtnYes);
-        btnNo.replaceWith(newBtnNo);
+            textElem.innerText = mode === 'detail' 
+                ? `Would you like AI assistance analyzing this stock?`
+                : `Would you like AI to rank these compared stocks?`;
 
-        newBtnNo.addEventListener('click', () => {
-            popup.classList.add('translate-y-[150%]');
-        });
+            // Explicitly trigger translation classes for Tailwind to pick up the transition
+            popup.classList.remove('translate-y-[150%]');
+            popup.classList.add('translate-y-0');
 
-        newBtnYes.addEventListener('click', () => {
-            popup.classList.add('translate-y-[150%]');
-            if (mode === 'detail') this.runDetailAnalysis(data);
-            if (mode === 'compare') this.runCompareAnalysis(data);
-        });
+            // Clear existing event listeners to prevent cross-contamination
+            const newBtnYes = btnYes.cloneNode(true);
+            const newBtnNo = btnNo.cloneNode(true);
+            btnYes.replaceWith(newBtnYes);
+            btnNo.replaceWith(newBtnNo);
+
+            newBtnNo.addEventListener('click', () => {
+                popup.classList.remove('translate-y-0');
+                popup.classList.add('translate-y-[150%]');
+            });
+
+            newBtnYes.addEventListener('click', () => {
+                popup.classList.remove('translate-y-0');
+                popup.classList.add('translate-y-[150%]');
+                if (mode === 'detail') this.runDetailAnalysis(data);
+                if (mode === 'compare') this.runCompareAnalysis(data);
+            });
+        }, 3000);
     },
 
     async runDetailAnalysis(data) {
-        const contId = 'sd-ai-analysis-container';
-        const txtId = 'sd-ai-analysis-content';
+        const userMsg = `Analyze details of stock '${data.symbol}'`;
         
-        // Check cache AFTER user confirms they want the analysis
-        const cachedResult = localStorage.getItem(data.cacheKey);
-        if (cachedResult) {
-            this.renderAnalysis(contId, txtId, cachedResult);
-            return;
+        // Dispatch the message directly through the centralized socket pipeline
+        // This ensures the backend `ai_agent.py` receives and processes the contextual request
+        if (window.ChatUI && window.ChatUI.sendAIMessage) {
+            window.ChatUI.sendAIMessage(userMsg);
+        } else if (window.ChatUI) {
+            // Fallback
+            window.ChatUI.addMessage(userMsg, true);
         }
 
-        this.renderLoading(contId, txtId);
-
-        const embedding = await window.ApiClient.getLatentEmbedding(data.symbol);
-        if (!embedding) {
-            this.renderAnalysis(contId, txtId, "Failed to compile latent embedding vector.");
-            return;
-        }
-
-        const prompt = `
-Analyze this stock based on the following compressed market state embedding vector.
-Company: ${data.name}
-Symbol: ${data.symbol}
-
-Embedding Vector Indices:
-[close, dist_from_ma50, daily_return_1d, daily_return_5d, lagged_return_t1, lagged_return_t3, lagged_return_t5, rsi, macd, obv_slope_5d, adx, rolling_vol_20d_std, atr, daily_range, ma20, ma50, ema20, volume, volume_ma20, volume_change_pct, bb_width, vol_close_corr_20d, cumulative_return, dist_from_ma50]
-
-Embedding Vector:
-${JSON.stringify(embedding)}
-
-Please provide a structured, concise analysis detailing EXACTLY these 5 points based on the indicators above:
-1. Trend direction (Using MAs)
-2. Volatility (Using ATR/BB_Width)
-3. Momentum (Using RSI/MACD)
-4. Forecast interpretation (What the data suggests next)
-5. Bullish/Bearish scenarios
-
-Format using clean markdown.`;
-
-        const result = await window.ApiClient.callGeminiAPI(prompt);
-        if (result && !result.startsWith("Generation Error")) {
-            localStorage.setItem(data.cacheKey, result);
-        }
-        this.renderAnalysis(contId, txtId, result);
+        // Switch to the chat view smoothly after dispatching so context states are captured cleanly
+        if (window.navigateTo) window.navigateTo('chat');
     },
 
     async runCompareAnalysis(data) {
-        const contId = 'compare-ai-analysis-container';
-        const txtId = 'compare-ai-analysis-content';
-
-        // Check cache AFTER user confirms they want the analysis
-        const cachedResult = localStorage.getItem(data.cacheKey);
-        if (cachedResult) {
-            this.renderAnalysis(contId, txtId, cachedResult);
-            return;
+        const symbolsStr = data.symbols.join(', ');
+        const userMsg = `Compare stocks '${symbolsStr}'`;
+        
+        // Dispatch the message directly through the centralized socket pipeline
+        // This ensures the backend `ai_agent.py` receives and processes the contextual request
+        if (window.ChatUI && window.ChatUI.sendAIMessage) {
+            window.ChatUI.sendAIMessage(userMsg);
+        } else if (window.ChatUI) {
+            // Fallback
+            window.ChatUI.addMessage(userMsg, true);
         }
 
-        this.renderLoading(contId, txtId);
-
-        const embeddingsArray = [];
-        for (const sym of data.symbols) {
-            const vector = await window.ApiClient.getLatentEmbedding(sym);
-            if (vector) {
-                embeddingsArray.push({ symbol: sym, embedding: vector });
-            }
-        }
-
-        if (embeddingsArray.length < 2) {
-            this.renderAnalysis(contId, txtId, "Failed to compile necessary embedding vectors.");
-            return;
-        }
-
-        const prompt = `
-Rank the following stocks based on their compiled market state embedding vectors.
-
-Embedding Vector Indices:
-[close, dist_from_ma50, daily_return_1d, daily_return_5d, lagged_return_t1, lagged_return_t3, lagged_return_t5, rsi, macd, obv_slope_5d, adx, rolling_vol_20d_std, atr, daily_range, ma20, ma50, ema20, volume, volume_ma20, volume_change_pct, bb_width, vol_close_corr_20d, cumulative_return, dist_from_ma50]
-
-Stocks Data:
-${JSON.stringify(embeddingsArray, null, 2)}
-
-Please rank these stocks and provide a brief justification based on:
-1. Trend strength
-2. Momentum
-3. Risk level
-
-Format the output clearly in markdown.`;
-
-        const result = await window.ApiClient.callGeminiAPI(prompt);
-        if (result && !result.startsWith("Generation Error")) {
-            localStorage.setItem(data.cacheKey, result);
-        }
-        this.renderAnalysis(contId, txtId, result);
-    },
-
-    renderLoading(containerId, textId) {
-        const container = document.getElementById(containerId);
-        const content = document.getElementById(textId);
-        container.classList.remove('hidden');
-        content.innerHTML = `<div class="flex items-center gap-2 text-purple-400">
-            <div class="w-4 h-4 border-2 border-purple-400 border-t-transparent rounded-full animate-spin"></div> 
-            Processing market state & interacting with LLM...
-        </div>`;
-    },
-
-    renderAnalysis(containerId, textId, markdownText) {
-        const container = document.getElementById(containerId);
-        const content = document.getElementById(textId);
-        container.classList.remove('hidden');
-        if (typeof marked !== 'undefined') {
-            content.innerHTML = marked.parse(markdownText);
-        } else {
-            content.innerText = markdownText;
-        }
+        // Switch to the chat view smoothly after dispatching so context states are captured cleanly
+        if (window.navigateTo) window.navigateTo('chat');
     }
 };

@@ -11,11 +11,11 @@ x-app-common: &app-common
       condition: service_started
   environment:
     - GEMINI_API_KEY=${GEMINI_API_KEY}
-    - REDIS_URL=redis://redis:6379/0
+    - REDIS_URL=redis://redis:26379/0
     # Database credentials matching the 'db' service
     - PGPASSWORD=hypestock_password_idk
-    - DATABASE_URL_ASYNC=postgresql+asyncpg://admin:hypestock_password_idk@db:5432/stock_data
-    - DATABASE_URL_SYNC=postgresql://admin:hypestock_password_idk@db:5432/stock_data
+    - DATABASE_URL_ASYNC=postgresql+asyncpg://admin:hypestock_password_idk@db:15432/stock_data
+    - DATABASE_URL_SYNC=postgresql://admin:hypestock_password_idk@db:15432/stock_data
   restart: unless-stopped
 
 services:
@@ -27,12 +27,13 @@ services:
       POSTGRES_USER: admin
       POSTGRES_PASSWORD: hypestock_password_idk
       POSTGRES_DB: stock_data
+      PGPORT: 15432 # Shifted internal port
     ports:
-      - "25432:25432"
+      - "15432:15432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U admin -d stock_data"]
+      test: ["CMD-SHELL", "pg_isready -U admin -d stock_data -p 15432"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -43,6 +44,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: hypestock-redis
+    command: redis-server --port 26379 # Shifted internal port
     ports:
       - "26379:26379"
     restart: unless-stopped
@@ -51,8 +53,10 @@ services:
   backend:
     <<: *app-common # This injects all the properties from x-app-common
     container_name: hypestock-backend
-    ports:
-      - "12000:12000"
+    # Removed host port mapping to avoid conflicts with frontend. 
+    # Nginx will securely route traffic to it internally on port 12000.
+    expose:
+      - "12000"
 
   # 5. Celery Worker - For asynchronous AI processing (Phase 4 of blueprint)
   celery_worker:
@@ -68,7 +72,7 @@ services:
       dockerfile: Dockerfile
     container_name: hypestock-frontend
     ports:
-      - "80:80" # The single unified entrypoint for your network (http://<host-ip>)
+      - "12000:80" # Shifted host mapping away from port 80
     volumes:
       # Injects the new Gateway configuration (HTML is now baked in during the build stage)
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro

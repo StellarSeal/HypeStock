@@ -37,7 +37,7 @@ RUN cat <<'EOF' > /app/entrypoint.sh
 #!/bin/bash
 echo "Waiting for PostgreSQL to start..."
 export PGPASSWORD="$PGPASSWORD"
-until pg_isready -h db -U admin -d stock_data 2>/dev/null; do
+until pg_isready -h db -p 15432 -U admin -d stock_data 2>/dev/null; do
   echo "PostgreSQL not ready yet, retrying in 2s..."
   sleep 2
 done
@@ -47,20 +47,20 @@ done
 if [ "$1" = "uvicorn" ]; then
 
     echo "Creating tables..."
-    psql -h db -U admin -d stock_data -c "CREATE TABLE IF NOT EXISTS companies (stock_code VARCHAR(50), company_name VARCHAR(255));"
-    psql -h db -U admin -d stock_data -c "CREATE TABLE IF NOT EXISTS stock_prices (time TIMESTAMP, symbol VARCHAR(50), open FLOAT, high FLOAT, low FLOAT, close FLOAT, volume BIGINT);"
+    psql -h db -p 15432 -U admin -d stock_data -c "CREATE TABLE IF NOT EXISTS companies (stock_code VARCHAR(50), company_name VARCHAR(255));"
+    psql -h db -p 15432 -U admin -d stock_data -c "CREATE TABLE IF NOT EXISTS stock_prices (time TIMESTAMP, symbol VARCHAR(50), open FLOAT, high FLOAT, low FLOAT, close FLOAT, volume BIGINT);"
     
     # Removed overlapping fields (open, high, low, close, volume) to comply with new schema
-    psql -h db -U admin -d stock_data -c "CREATE TABLE IF NOT EXISTS metrics (\"time\" DATE, symbol VARCHAR(50), MA20 DOUBLE PRECISION, MA50 DOUBLE PRECISION, EMA20 DOUBLE PRECISION, RSI DOUBLE PRECISION, MACD DOUBLE PRECISION, Rolling_Vol_20d_std DOUBLE PRECISION, ATR DOUBLE PRECISION, Volume_MA20 DOUBLE PRECISION, Volume_Change_pct DOUBLE PRECISION, Daily_Return_1d DOUBLE PRECISION, Daily_Return_5d DOUBLE PRECISION, Cumulative_Return DOUBLE PRECISION, Daily_Range DOUBLE PRECISION, Vol_Close_Corr_20d DOUBLE PRECISION, BB_Width DOUBLE PRECISION, ADX DOUBLE PRECISION, OBV_Slope_5d DOUBLE PRECISION, Lagged_Return_t1 DOUBLE PRECISION, Lagged_Return_t3 DOUBLE PRECISION, Lagged_Return_t5 DOUBLE PRECISION, Dist_from_MA50 DOUBLE PRECISION);"
+    psql -h db -p 15432 -U admin -d stock_data -c "CREATE TABLE IF NOT EXISTS metrics (\"time\" DATE, symbol VARCHAR(50), MA20 DOUBLE PRECISION, MA50 DOUBLE PRECISION, EMA20 DOUBLE PRECISION, RSI DOUBLE PRECISION, MACD DOUBLE PRECISION, Rolling_Vol_20d_std DOUBLE PRECISION, ATR DOUBLE PRECISION, Volume_MA20 DOUBLE PRECISION, Volume_Change_pct DOUBLE PRECISION, Daily_Return_1d DOUBLE PRECISION, Daily_Return_5d DOUBLE PRECISION, Cumulative_Return DOUBLE PRECISION, Daily_Range DOUBLE PRECISION, Vol_Close_Corr_20d DOUBLE PRECISION, BB_Width DOUBLE PRECISION, ADX DOUBLE PRECISION, OBV_Slope_5d DOUBLE PRECISION, Lagged_Return_t1 DOUBLE PRECISION, Lagged_Return_t3 DOUBLE PRECISION, Lagged_Return_t5 DOUBLE PRECISION, Dist_from_MA50 DOUBLE PRECISION);"
 
     echo "Clearing old data to prevent duplicates..."
-    psql -h db -U admin -d stock_data -c "TRUNCATE TABLE companies, stock_prices, metrics;"
+    psql -h db -p 15432 -U admin -d stock_data -c "TRUNCATE TABLE companies, stock_prices, metrics;"
 
     echo "Importing CSV data..."
     # \copy is a psql meta-command and does not require a trailing semicolon
-    psql -h db -U admin -d stock_data -c "\copy companies FROM '/app/companies.csv' DELIMITER ',' CSV HEADER"
-    psql -h db -U admin -d stock_data -c "\copy stock_prices FROM '/app/stock_prices.csv' DELIMITER ',' CSV HEADER"
-    psql -h db -U admin -d stock_data -c "\copy metrics FROM '/app/metrics.csv' DELIMITER ',' CSV HEADER"
+    psql -h db -p 15432 -U admin -d stock_data -c "\copy companies FROM '/app/companies.csv' DELIMITER ',' CSV HEADER"
+    psql -h db -p 15432 -U admin -d stock_data -c "\copy stock_prices FROM '/app/stock_prices.csv' DELIMITER ',' CSV HEADER"
+    psql -h db -p 15432 -U admin -d stock_data -c "\copy metrics FROM '/app/metrics.csv' DELIMITER ',' CSV HEADER"
 else
     echo "Skipping database population for worker process..."
 fi

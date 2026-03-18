@@ -6,7 +6,7 @@ from models import build_envelope
 
 # --- CONFIGURATION ---
 # Target the updated Redis port schema for message brokering
-REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:16379/0")
+REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:26379/0")
 
 # Initialize the Celery Application
 celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
@@ -23,7 +23,7 @@ def process_ai_chat(sid: str, request_id: str, content: str, seed: int, context:
     Offloads heavy LLM/PandasAI generation from the main event loop.
     """
     try:
-        response = ai_gateway.answer_chat_query(content, context)
+        response = ai_gateway.answer_chat_query(sid, content, context)
         
         # The frontend script.js expects a payload with type="ai" and the specific seed
         payload = {
@@ -59,6 +59,15 @@ def generate_prediction_explanation(sid: str, request_id: str, symbol: str, rang
     except Exception as e:
         error_envelope = build_envelope('error', request_id, {"code": 500, "message": f"Explanation Error: {str(e)}"})
         socket_manager.emit('error', error_envelope, room=sid)
+
+
+@celery_app.task(name="tasks.clear_user_memory")
+def clear_user_memory(sid: str):
+    """
+    Frees in-process AI session memory on client disconnects.
+    """
+    from ai_agent import session_memory_store
+    session_memory_store.free_memory(sid)
 
 
 @celery_app.task(name="tasks.compute_feature_importance")

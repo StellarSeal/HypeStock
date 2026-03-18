@@ -376,8 +376,11 @@ window.CompareView = {
             const color = CompareStore.colors[i];
             const isHighlighted = CompareStore.highlightedSymbol === sym;
             const bg = isHighlighted ? 'bg-slate-800 shadow-md' : 'bg-slate-900';
-            const border = isHighlighted ? color : '#1e293b'; // slate-800
-            const formattedVal = val !== null && val !== undefined ? Number(val).toLocaleString('en-US', {maximumFractionDigits: 3}) : '--';
+            const border = isHighlighted ? color : '#1e293b';
+            
+            const isPrice = ['open', 'high', 'low', 'close'].includes(CompareStore.activeMetric.toLowerCase());
+            const formattedVal = val !== null && val !== undefined ? 
+                (isPrice ? (Number(val) * 1000).toLocaleString('en-US', {maximumFractionDigits: 0}) + ' VNĐ' : Number(val).toLocaleString('en-US', {maximumFractionDigits: 3})) : '--';
 
             return `
                 <div class="px-4 py-2 rounded-xl border flex items-center gap-3 transition-all ${bg}" style="border-color: ${border}">

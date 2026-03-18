@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 # Target TimescaleDB Container in docker-compose (Updated Ports to match internal mapping)
 ASYNC_DB_URL = os.environ.get("DATABASE_URL_ASYNC", "postgresql+asyncpg://admin:hypestock_password_idk@db:15432/stock_data")
 SYNC_DB_URL = os.environ.get("DATABASE_URL_SYNC", "postgresql://admin:hypestock_password_idk@db:15432/stock_data")
-REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:16379/0")
+REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:26379/0")
 
 # 1. Async Engine (For FastAPI Event Loop)
 # REMEDIATION: Increased connection pool limits and timeouts to prevent connection starvation

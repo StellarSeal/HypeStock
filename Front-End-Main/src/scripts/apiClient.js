@@ -31,8 +31,8 @@ window.ApiClient = {
         return await this.fetchWithFallback(`/stock/${symbol}/indicator?type=${type}&range=${range}`);
     },
 
-    async getPrediction(symbol, range, algo = 'regression') {
-        return await this.fetchWithFallback(`/stock/${symbol}/prediction?range=${range}&algo=${algo}`);
+    async getPrediction(symbol) {
+        return await this.fetchWithFallback(`/stock/${symbol}/prediction`);
     },
 
     async searchStocks(query) {

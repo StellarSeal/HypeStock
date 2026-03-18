@@ -394,28 +394,38 @@ function sendAIMessage(content) {
         return;
     }
 
-    // Dynamic Context Injection to optimize returns logic based on current user view
-    let activeContext = "";
+    // Obfuscated Payload Construction - Passed as formatted JSON string to Backend
+    let contextObj = {
+        details: "",
+        compare: "",
+        graph_data: ""
+    };
+
     if (currentTabIndex === 2 && window.StockDetail && window.StockDetail.symbol) {
-        activeContext = `User is currently viewing detailed metrics for stock: ${window.StockDetail.symbol}. `;
+        contextObj.details = window.StockDetail.symbol;
         if (window.StockCache && window.StockCache.summary && window.StockCache.summary.metrics) {
             const m = window.StockCache.summary.metrics;
-            activeContext += `Key Metrics Context: High Close = ${m.highest_close}, Low Close = ${m.lowest_close}, Avg Vol = ${m.average_volume}, Volatility = ${m.volatility}, Cum Return = ${m.cumulative_return}%.`;
+            contextObj.details += ` (High: ${m.highest_close}, Low: ${m.lowest_close}, Vol: ${m.average_volume})`;
+        }
+        
+        // COMPRESSION: Add dense graph/metrics data representation to consume least tokens
+        const range = window.StockDetail.range || '1M';
+        if (window.StockCache && window.StockCache.prices && window.StockCache.prices[range]) {
+            const prices = window.StockCache.prices[range];
+            // Get last 30 data points, map into tight string
+            const recent = prices.slice(-30);
+            const c = recent.map(p => Number(p.close).toFixed(2)).join(',');
+            const v = recent.map(p => {
+                const vol = Number(p.volume);
+                return vol >= 1000000 ? (vol/1000000).toFixed(1)+'M' : (vol/1000).toFixed(0)+'k';
+            }).join(',');
+            
+            contextObj.graph_data = `T[30d] C[${c}] V[${v}]`;
         }
     } else if (currentTabIndex === 3 && window.CompareStore && window.CompareStore.symbols.length > 0) {
-        activeContext = `User is currently comparing these stocks: ${window.CompareStore.symbols.join(', ')}. `;
-        if (window.CompareStore.dataCache && window.CompareStore.dataCache.data) {
-            activeContext += "Latest comparison metrics context: ";
-            const activeMet = window.CompareStore.activeMetric;
-            const metData = window.CompareStore.dataCache.data[activeMet];
-            if (metData && metData.length > 0) {
-                const last = metData[metData.length - 1];
-                const vals = window.CompareStore.symbols.map(sym => `${sym}: ${last[sym]}`).join(', ');
-                activeContext += `[Metric: ${activeMet}] -> ${vals}.`;
-            }
-        }
+        contextObj.compare = window.CompareStore.symbols.join(', ');
     } else if (currentTabIndex === 1) {
-        activeContext = `User is currently browsing the broader stock list menu.`;
+        contextObj.details = "Browsing stock list";
     }
 
     const seed = Math.floor(Math.random() * 2147483647);
@@ -424,9 +434,10 @@ function sendAIMessage(content) {
         type: "ai", 
         content: content, 
         seed: seed,
-        context: activeContext
+        context: JSON.stringify(contextObj)
     };
     
+    // UI strictly only displays the concise user query
     addMessage(content, true);
     showTypingIndicator();
     
@@ -450,7 +461,12 @@ function handleServerMessage(envelope) {
             clearTimeout(req.timeoutId);
             pendingAIRequests.delete(data.seed);
             removeTypingIndicator();
-            if (data.response) addMessage(data.response, false);
+            
+            if (req.onResponse) {
+                req.onResponse(data.response);
+            } else if (data.response) {
+                addMessage(data.response, false);
+            }
         }
     }
 }
@@ -460,7 +476,7 @@ const chatBtn = document.getElementById('chat-btn');
 const chatMessages = document.getElementById('chat-messages');
 let typingElement = null;
 
-const avatarHtml = `<div class="w-8 h-8 rounded-full border border-sky-500/30 flex items-center justify-center flex-shrink-0 overflow-hidden bg-slate-800"><img src="../assets/bot.png" alt="Hypo" class="w-full h-full object-cover"></div>`;
+const avatarHtml = `<div class="w-8 h-8 rounded-full border border-sky-500/30 flex items-center justify-center flex-shrink-0 overflow-hidden bg-slate-800"><img src="../assets/bot.jpg" alt="Hypo" class="w-full h-full object-cover"></div>`;
 
 function addMessage(text, isUser) {
     if (!chatMessages) return;
@@ -534,7 +550,7 @@ window.addEventListener('load', () => {
                 observer.unobserve(entry.target);
             }
         });
-    }, { threshold: 0.3 });
+    }, { threshold: 0.1 });
     
     const aboutProjectSection = document.getElementById('about-project');
     if (aboutProjectSection) {
@@ -592,10 +608,40 @@ function scrollToAbout() {
     }
 }
 
+function hideDisplayedModalsOnTabSwitch() {
+    const predictModal = document.getElementById('predict-modal');
+    if (predictModal && !predictModal.classList.contains('hidden')) {
+        if (window.StockDetail && typeof window.StockDetail.closePredictModal === 'function') {
+            window.StockDetail.closePredictModal(true);
+        } else {
+            predictModal.classList.add('opacity-0');
+            predictModal.classList.add('hidden');
+        }
+    }
+
+    const compareModal = document.getElementById('compare-modal');
+    if (compareModal && !compareModal.classList.contains('hidden')) {
+        compareModal.style.opacity = '0';
+        compareModal.style.display = 'none';
+        compareModal.classList.add('hidden');
+    }
+
+    const assistantPopup = document.getElementById('ai-assistant-popup');
+    if (assistantPopup) {
+        assistantPopup.classList.remove('translate-y-0');
+        assistantPopup.classList.add('translate-y-[150%]');
+    }
+}
+
 function navigateTo(targetId) {
     if (isFocusMode) return;
     const index = tabs.indexOf(targetId);
     if (index === -1) return;
+
+    if (currentTabIndex !== index) {
+        hideDisplayedModalsOnTabSwitch();
+    }
+
     currentTabIndex = index;
     if (pageTrack) pageTrack.style.transform = `translateX(-${currentTabIndex * 100}vw)`;
     
@@ -667,19 +713,64 @@ if (searchInput) {
 }
 
 function showToast(message, type = 'info') {
-    const existing = document.querySelector('.toast-notification');
-    if (existing) existing.remove();
+    let container = document.getElementById('toast-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'toast-container';
+        document.body.appendChild(container);
+    }
+
+    const toasts = container.querySelectorAll('.toast-notification');
+    if (toasts.length >= 3) {
+        toasts[0].remove();
+    }
+
     const toast = document.createElement('div');
     toast.className = 'toast-notification';
     const color = type === 'error' ? 'bg-rose-500' : 'bg-sky-400';
-    toast.innerHTML = `<div class="w-2 h-2 rounded-full ${color} animate-pulse"></div><span>${message}</span>`;
-    document.body.appendChild(toast);
+    toast.innerHTML = `<div class="w-2 h-2 rounded-full ${color} animate-pulse shrink-0"></div><span>${message}</span>`;
+    container.appendChild(toast);
+
     setTimeout(() => {
         toast.classList.add('toast-fading-out');
         toast.addEventListener('animationend', () => toast.remove());
     }, 3500);
 }
 
+// Global Exports
 window.navigateTo = navigateTo;
 window.scrollToAbout = scrollToAbout;
 window.showToast = showToast;
+window.ChatUI = {
+    addMessage,
+    showTypingIndicator,
+    removeTypingIndicator,
+    sendAIMessage, // Exposed for AIAssistant integration
+    sendHiddenQuery: (prompt, seed, onResponse) => {
+        // Exposes a method for AIAssistant to funnel giant context prompts through the backend.
+        if (!socket || !socket.connected) {
+            removeTypingIndicator();
+            addMessage("Offline Mode: Connect backend for AI.", false);
+            return;
+        }
+
+        const payload = { 
+            request_id: generateReqId(),
+            type: "ai", 
+            content: prompt, 
+            seed: seed,
+            context: "{}" // Empty to let backend directly digest the giant prompt.
+        };
+        
+        const timeoutId = setTimeout(() => {
+            if (pendingAIRequests.has(seed)) {
+                pendingAIRequests.delete(seed);
+                removeTypingIndicator();
+                addMessage("No response from server.", false);
+            }
+        }, 60000); 
+        
+        pendingAIRequests.set(seed, { timeoutId, onResponse });
+        socket.emit('ai', payload);
+    }
+};

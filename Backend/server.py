@@ -11,7 +11,7 @@ import socketio
 import dataset_service 
 from database import redis_client, init_db_indexes
 from models import ExplainPredictionRequest, build_envelope, SummaryResponse, PredictionResponse, CompareRequest
-from tasks import generate_prediction_explanation, process_ai_chat
+from tasks import generate_prediction_explanation, process_ai_chat, clear_user_memory
 from ml_model import predict_ensemble
 
 # --- GLOBAL TRACKING STATE ---
@@ -20,7 +20,7 @@ ACTIVE_USERS = set()
 REQUEST_HISTORY = deque(maxlen=2000)
 
 # --- SETUP FASTAPI & ASGI SOCKET.IO ---
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:16379/0")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:26379/0")
 mgr = socketio.AsyncRedisManager(REDIS_URL)
 sio = socketio.AsyncServer(async_mode='asgi', client_manager=mgr, cors_allowed_origins='*')
 
@@ -137,6 +137,8 @@ async def connect(sid, environ):
 async def disconnect(sid):
     ACTIVE_USERS.discard(sid)
     print(f"[WS] Client disconnected: {sid}. Active: {len(ACTIVE_USERS)}")
+    # Dispatch Celery task to release in-process AI session memory
+    clear_user_memory.delay(sid)
 
 @sio.on('startup')
 async def handle_startup(sid, data):

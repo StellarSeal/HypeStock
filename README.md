@@ -7,7 +7,7 @@
 </div>
 
 > [!WARNING]
-> This project is designed for a full Docker environment. Run all services together (`db`, `redis`, `ollama`, `backend`, `celery_worker`, `frontend`) to avoid runtime failures.
+> This project is designed for a full Docker environment. Run all services together (`db`, `redis`, `backend`, `celery_worker`, `frontend`) to avoid runtime failures.
 
 > [!NOTE]
 > This project was made for DAP391 course (AI1905) - Spring 2026, FPT University
@@ -22,8 +22,8 @@ HypeStock allows users to browse through live stock data computed by our systems
 
 - Docker + Docker Compose v2
 - Python 3.11 (for local development outside Docker)
-- NVIDIA GPU + NVIDIA Container Toolkit (recommended for Ollama container acceleration)
-- Internet connection (for pulling Docker images and AI models)
+- NVIDIA GPU + NVIDIA Container Toolkit (recommended for PyTorch model inference acceleration)
+- Internet connection (for pulling Docker images)
 - Optional: `GEMINI_API_KEY` for cloud AI provider mode
 
 ## 📦 Building
@@ -73,7 +73,6 @@ Primary runtime configuration lives in:
 Key environment variables:
 
 - `GEMINI_API_KEY` - Enables Gemini cloud responses
-- `OLLAMA_URL` - Local LLM endpoint (default: `http://ollama:11434/api/chat`)
 - `REDIS_URL` - Redis broker/manager URL (default: `redis://redis:6379/0`)
 
 ## 🔌 Tech stack - Core services/Dependencies
@@ -82,9 +81,8 @@ Core services from `docker-compose.yml`:
 
 - `db` - TimescaleDB/PostgreSQL data store
 - `redis` - Caching and Celery broker
-- `ollama` - Local model serving (pulls `deepseek-r1:7b`)
 - `backend` - FastAPI + Socket.IO server
-- `celery_worker` - Async AI processing worker
+- `celery_worker` - Async AI processing worker, including our self-trained PyTorch model inference
 - `frontend` - Nginx static host for `Front-End-Main/`
 
 Python backend dependencies are listed in `requirements.txt` (FastAPI, Socket.IO, Celery, Redis, SQLAlchemy, asyncpg, pandas, google-genai, pandasai, etc.).
@@ -100,16 +98,15 @@ Python backend dependencies are listed in `requirements.txt` (FastAPI, Socket.IO
 
 ## 📝 Notes
 
-- On first startup, Ollama pulls `deepseek-r1:7b`, so initialization may take several minutes.
 - The backend container imports CSV data into PostgreSQL on startup and truncates existing `companies`/`stock_prices` to avoid duplicates.
 - Default database credentials in compose are development-only and should be changed for production.
 
 ---
 
-System recommendations (for local Ollama usage, tuned for `deepseek-r1:7b`):
+System recommendations (for running the self-trained PyTorch model locally):
 
 - CPU: **Intel i5-12400/AMD Ryzen 5 5600** or better
-- Memory: **16GB RAM** minimum (12GB+ VRAM recommended)
-- GPU: **RTX 3050** or higher
-- Storage: **40GB** free storage (ideally prioritize SSDs for faster I/O operations) or more
+- Memory: **16GB RAM** minimum
+- GPU: **RTX 3050** or higher (for accelerated inference)
+- Storage: **25GB** free storage (ideally prioritize SSDs for faster I/O operations) or more
 - Any OS that supports **Docker**

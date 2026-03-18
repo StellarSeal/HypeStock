@@ -1,0 +1,19 @@
+[
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "ma20",
+    "ma50",
+    "ema20",
+    "rsi",
+    "macd",
+    "volatility",
+    "atr",
+    "daily_return_1d",
+    "lagged_return_t1",
+    "lagged_return_t3",
+    "lagged_return_t5",
+    "dist_from_ma50"
+]

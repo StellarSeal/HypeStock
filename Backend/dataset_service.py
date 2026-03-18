@@ -149,9 +149,14 @@ async def get_stock_price(symbol: str, range_val: str) -> list:
         async with AsyncSessionLocal() as session:
             # Joining tables since metrics no longer contains OHLCV
             sql = text("""
-                SELECT p."time", p.open, p.high, p.low, p.close, p.volume, m.ma20, m.ma50 
+                SELECT p."time", p.open, p.high, p.low, p.close, p.volume,
+                       m.ma20, m.ma50, m.ema20, m.rsi, m.macd,
+                       m.rolling_vol_20d_std as volatility,
+                       m.atr, m.daily_return_1d,
+                       m.lagged_return_t1, m.lagged_return_t3, m.lagged_return_t5,
+                       m.dist_from_ma50
                 FROM stock_prices p
-                LEFT JOIN metrics m ON p.symbol = m.symbol AND p."time"::date = m."time"
+                LEFT JOIN metrics m ON p.symbol = m.symbol AND p."time" = m."time"
                 WHERE p.symbol = :sym AND p."time" >= :start 
                 ORDER BY p."time" ASC
                 LIMIT :limit
@@ -165,13 +170,23 @@ async def get_stock_price(symbol: str, range_val: str) -> list:
 
         return [{
             "time": safe_serialize_time(r.time),
-            "open": float(r.open) if r.open else 0.0, 
-            "high": float(r.high) if r.high else 0.0, 
-            "low": float(r.low) if r.low else 0.0, 
-            "close": float(r.close) if r.close else 0.0, 
-            "volume": int(r.volume) if r.volume else 0,
-            "ma20": float(r.ma20) if r.ma20 else None,
-            "ma50": float(r.ma50) if r.ma50 else None
+            "open": float(r.open) if r.open is not None else 0.0,
+            "high": float(r.high) if r.high is not None else 0.0,
+            "low": float(r.low) if r.low is not None else 0.0,
+            "close": float(r.close) if r.close is not None else 0.0,
+            "volume": int(r.volume) if r.volume is not None else 0,
+            "ma20": float(r.ma20) if r.ma20 is not None else None,
+            "ma50": float(r.ma50) if r.ma50 is not None else None,
+            "ema20": float(r.ema20) if r.ema20 is not None else None,
+            "rsi": float(r.rsi) if r.rsi is not None else None,
+            "macd": float(r.macd) if r.macd is not None else None,
+            "volatility": float(r.volatility) if r.volatility is not None else None,
+            "atr": float(r.atr) if r.atr is not None else None,
+            "daily_return_1d": float(r.daily_return_1d) if r.daily_return_1d is not None else None,
+            "lagged_return_t1": float(r.lagged_return_t1) if r.lagged_return_t1 is not None else None,
+            "lagged_return_t3": float(r.lagged_return_t3) if r.lagged_return_t3 is not None else None,
+            "lagged_return_t5": float(r.lagged_return_t5) if r.lagged_return_t5 is not None else None,
+            "dist_from_ma50": float(r.dist_from_ma50) if r.dist_from_ma50 is not None else None,
         } for r in sampled_rows]
         
     except Exception as e:
@@ -214,8 +229,8 @@ async def get_stock_indicator(symbol: str, indicator_type: str, range_val: str) 
 
         return [{
             "time": safe_serialize_time(getattr(r, 'time')), 
-            "value": float(r.value) 
-        } for r in sampled_rows if r.value is not None]
+            "value": float(r.value) if r.value is not None else None
+        } for r in sampled_rows]
         
     except Exception as e:
         logger.error(f"DB Error in get_stock_indicator for {symbol}: {str(e)}")
@@ -304,9 +319,11 @@ async def get_comparison_data(symbols: list[str], range_val: str) -> dict:
             sql = text("""
                 SELECT p."time", p.symbol, p.open, p.high, p.low, p.close, p.volume,
                        m.ma20, m.ma50, m.ema20, m.rsi, m.macd, m.rolling_vol_20d_std as volatility,
-                       m.atr, m.daily_return_1d as daily_return, m.cumulative_return
+                       m.atr, m.daily_return_1d,
+                       m.lagged_return_t1, m.lagged_return_t3, m.lagged_return_t5,
+                       m.dist_from_ma50
                 FROM stock_prices p
-                LEFT JOIN metrics m ON p.symbol = m.symbol AND p."time"::date = m."time"
+                LEFT JOIN metrics m ON p.symbol = m.symbol AND p."time" = m."time"
                 WHERE p.symbol IN :symbols AND p."time" >= :start
                 ORDER BY p."time" ASC
             """).bindparams(bindparam('symbols', expanding=True))
@@ -320,7 +337,13 @@ async def get_comparison_data(symbols: list[str], range_val: str) -> dict:
         df = pd.DataFrame([dict(r._mapping) for r in rows])
         df['time'] = pd.to_datetime(df['time']).dt.strftime('%Y-%m-%dT%H:%M:%SZ')
 
-        metrics_list = ['open', 'high', 'low', 'close', 'volume', 'ma20', 'ma50', 'ema20', 'rsi', 'macd', 'volatility', 'atr', 'daily_return', 'cumulative_return']
+        metrics_list = [
+            'open', 'high', 'low', 'close', 'volume',
+            'ma20', 'ma50', 'ema20', 'rsi', 'macd',
+            'volatility', 'atr', 'daily_return_1d',
+            'lagged_return_t1', 'lagged_return_t3', 'lagged_return_t5',
+            'dist_from_ma50',
+        ]
         available_metrics = [m for m in metrics_list if m in df.columns]
 
         payload_data = {}

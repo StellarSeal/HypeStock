@@ -1,0 +1,483 @@
+\documentclass{article}
+\usepackage{amsmath,amssymb,graphicx,hyperref,geometry,listings,booktabs}
+\usepackage{xcolor}
+\usepackage{longtable}
+
+\geometry{margin=1in}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\lstdefinestyle{paperstyle}{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue!70!black},
+    commentstyle=\color{green!40!black},
+    stringstyle=\color{red!60!black},
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    stepnumber=1,
+    numbersep=8pt,
+    showstringspaces=false,
+    breaklines=true,
+    frame=single,
+    tabsize=2
+}
+\lstset{style=paperstyle}
+
+\title{\textbf{HypeStock: A Production AI Stock Forecasting System with Telemetry-Grounded Optimization and Compressed Conversation Memory}}
+\author{DAP391 Research Engineering Group}
+\date{March 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This paper presents a production-grade stock forecasting platform that unifies a high-throughput machine learning stack with a latency-critical online serving architecture. The deployed system combines FastAPI plus Socket.IO, PostgreSQL plus TimescaleDB, Celery, Redis, and Nginx with a hybrid forecasting backbone composed of a Transformer encoder, attention pooling, GRU decoder, and LightGBM residual ensembling. The AI layer integrates Gemini and PandasAI for grounded natural-language interaction.
+
+A new architecture component is introduced: a self-implemented SessionMemory module is integrated as a compressed cross-message memory subsystem that stores and retrieves semantically compressed client and backend interactions. This enables continuity in AI responses without unbounded prompt growth.
+
+Although the model architecture supports multi-horizon outputs (7, 14, and 30 days), deployment is intentionally specialized to the 7-day horizon. We provide formal loss derivations, gradient interference analysis, and empirical validation from real training telemetry. We further analyze runtime parameters, optimization stability, and hardware-aware throughput behavior on Ryzen 7 7435HS plus RTX 4060 Laptop (16 GB RAM), using observed metrics including \texttt{pred\_mean}, \texttt{pred\_std}, \texttt{volatility\_loss}, \texttt{curvature\_loss}, and \texttt{acf1}.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Introduction}
+Production forecasting systems fail when model design, data systems, and runtime infrastructure are optimized in isolation. In equity prediction, this mismatch appears as unstable calibration, stale context, queue backpressure, and brittle explanation quality under changing market regimes. HypeStock is designed as an end-to-end system where database shape, model objective, queueing policy, and user-facing AI behavior are co-optimized.
+
+The central engineering decision in this paper is a controlled collapse from multi-horizon capability to single-horizon deployment, while preserving extensibility in the model interface and data schema. The central architecture decision is to add a self-implemented compressed memory component that captures all client and backend messages in semantically compressed form.
+
+\section{System Architecture and New Memory Component}
+\subsection{Service Topology}
+The production topology includes:
+\begin{itemize}
+\item FastAPI plus Socket.IO as the API and streaming plane.
+\item PostgreSQL plus TimescaleDB for historical and derived time-series storage.
+\item Celery for asynchronous model and analytics jobs.
+\item Redis for broker plus cache roles.
+\item Nginx for reverse proxying and static frontend delivery.
+\item PyTorch plus LightGBM for prediction.
+\item Gemini plus PandasAI for explanation and structured AI query handling.
+\end{itemize}
+
+End-to-end latency can be decomposed as
+\begin{equation}
+T_{e2e}=T_{fetch}+T_{feature}+T_{predict}+T_{cache}+T_{transport}.
+\end{equation}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.92\linewidth}{
+\centering
+Placeholder Figure 1: Model and service architecture diagram.\\
+FastAPI/Socket.IO API layer, Celery workers, Redis, TimescaleDB, Transformer+Attention+GRU forecaster, LightGBM ensemble, and a self-implemented SessionMemory compressed conversation memory component.
+}}
+\caption{End-to-end production architecture with the new self-implemented SessionMemory component.}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{Self-Implemented SessionMemory Component for Compressed Client and Backend Messages}
+The new component uses HypeStock's self-implemented SessionMemory module as a session-scoped compression and retrieval subsystem. For each websocket session $s$, the complete interaction stream is
+\begin{equation}
+M^{(s)}=\{(r_i,c_i,t_i)\}_{i=1}^{N_s}, \quad r_i \in \{\text{client},\text{backend}\},
+\end{equation}
+where $c_i$ is message content and $t_i$ is timestamp.
+
+SessionMemory applies semantic compression
+\begin{equation}
+Z^{(s)}=\mathcal{C}_{HS}(M^{(s)}),
+\end{equation}
+and query-aware retrieval
+\begin{equation}
+H_q^{(s)}=\mathcal{R}_{HS}(q,Z^{(s)},k),
+\end{equation}
+with $k$ bounded summary bullets injected into the classifier and response prompts.
+
+This design removes the previous fixed-length truncation and replaces it with compressed history over all recorded client and backend interactions in the session.
+
+\section{Forecasting Model Formulation}
+\subsection{Sliding Window Construction}
+Given a lookback $L$, each training sample is formed by
+\begin{equation}
+X_t=[x_{t-L},\ldots,x_t],
+\end{equation}
+where $x_t \in \mathbb{R}^d$ is the multivariate feature vector at time $t$.
+
+\subsection{Transformer Encoder}
+The attention block follows
+\begin{equation}
+\text{Attention}(Q,K,V)=\text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V.
+\end{equation}
+
+This supports long-range feature interactions across volatility, momentum, and microstructure channels before temporal decoding.
+
+\subsection{GRU Decoder Dynamics}
+The recurrent decoder is governed by
+\begin{equation}
+z_t = \sigma(W_z x_t + U_z h_{t-1}),
+\end{equation}
+\begin{equation}
+r_t = \sigma(W_r x_t + U_r h_{t-1}),
+\end{equation}
+\begin{equation}
+h_t = (1 - z_t) \odot h_{t-1} + z_t \odot \tilde{h}_t.
+\end{equation}
+
+The deployed output map is
+\begin{equation}
+\hat{y}_{t+7}=f(x_{t-L:t}).
+\end{equation}
+
+\section{Multi-Horizon Objective and 7-Day Collapse}
+\subsection{General Objective}
+Architecture-level training supports a horizon set $H=\{7,14,30\}$ with weighted objective
+\begin{equation}
+\mathcal{L}_{multi} = \sum_{h \in H} \alpha_h \cdot \mathcal{L}_h.
+\end{equation}
+
+Deployment is specialized to
+\begin{equation}
+\mathcal{L}_{7} = \mathcal{L}_{h=7}.
+\end{equation}
+
+\subsection{Gradient Interference Analysis}
+Let $g_h=\nabla_\theta \mathcal{L}_h$. Then
+\begin{equation}
+\nabla_\theta \mathcal{L}_{multi}=\sum_{h \in H} \alpha_h g_h,
+\end{equation}
+\begin{equation}
+\left\|\nabla_\theta \mathcal{L}_{multi}\right\|^2=
+\sum_{h \in H}\alpha_h^2\|g_h\|^2 + 2\sum_{i<j}\alpha_i\alpha_j g_i^\top g_j.
+\end{equation}
+
+The cross-term $g_i^\top g_j$ is negative under conflicting horizon updates (typical during regime transitions). This increases optimization variance and slows convergence. A useful interference score is
+\begin{equation}
+\Gamma=\frac{2\sum_{i<j}\alpha_i\alpha_j g_i^\top g_j}{\sum_{h \in H}\alpha_h^2\|g_h\|^2}.
+\end{equation}
+For single horizon, $\Gamma=0$ by construction, which improves optimizer stability and monitoring clarity.
+
+\subsection{Empirical Justification}
+Real telemetry shows stable improvement under 7-day specialization: stage-level validation MSE decreases from 0.4513 (stage 1) to 0.4405 (stage 2) to 0.4319 (stage 3), while directional accuracy peaks at 0.6845. These gains were obtained without horizon-coupled conflict terms.
+
+\section{Loss Design and Telemetry-Coupled Diagnostics}
+\subsection{Composite Objective}
+The training objective includes regression, volatility alignment, and curvature regularization:
+\begin{equation}
+\mathcal{L} = \lambda_1 \mathcal{L}_{reg} + \lambda_2 \mathcal{L}_{vol} + \lambda_3 \mathcal{L}_{curv}.
+\end{equation}
+
+Here,
+\begin{equation}
+\mathcal{L}_{vol}=\left|\sigma(\hat{y})-\sigma(y)\right|,
+\end{equation}
+and
+\begin{equation}
+\mathcal{L}_{curv}=\left\|\Delta^2 \hat{y}\right\|_1,
+\end{equation}
+which acts as a smoothness prior on predicted trajectories.
+
+\subsection{Autocorrelation and Sequence Memory}
+Lag-1 autocorrelation is measured as
+\begin{equation}
+\text{ACF}_1 = \frac{\mathbb{E}[(y_t - \mu)(y_{t-1} - \mu)]}{\sigma^2}.
+\end{equation}
+In this system, \texttt{acf1} is tracked on predictions to verify temporal consistency. Persistent high positive \texttt{acf1} can indicate decoder inertia; unstable sign flips can indicate noise amplification.
+
+\subsection{Observed Stage-Level Metrics}
+Telemetry from \texttt{training\_log\_7d.csv} is summarized in Table~\ref{tab:stage-metrics}.
+
+\begin{table}[t]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+Stage & Train loss & Val MSE & Val RMSE & Val dir acc \\
+\midrule
+1 & 1.1967 & 0.4513 & 0.5851 & 0.6795 \\
+2 & 0.7950 & 0.4405 & 0.5781 & 0.6757 \\
+3 & 0.6494 & 0.4319 & 0.5760 & 0.6845 \\
+\bottomrule
+\end{tabular}
+\caption{Stage-level improvement for 7-day training.}
+\label{tab:stage-metrics}
+\end{table}
+
+Observed behavior:
+\begin{itemize}
+\item Train loss decreases monotonically across stages, indicating optimization progress under increasing data exposure.
+\item Validation MSE reaches the global minimum at stage 3 (0.4319), validating late-stage generalization.
+\item Directional accuracy remains high and improves in stage 3, indicating that optimization did not collapse to mean prediction.
+\end{itemize}
+
+\subsection{Batch-Level Stability and Instability Events}
+Batch telemetry from \texttt{training\_batch\_diag\_7d.csv} reveals both stable regions and rare spikes. Typical ranges are:
+\begin{itemize}
+\item \texttt{pred\_mean}: 0.01 to 0.05
+\item \texttt{pred\_std}: 0.29 to 0.40
+\item \texttt{volatility\_loss}: 0.20 to 0.33
+\item \texttt{curvature\_loss}: 0.40 to 0.53
+\item \texttt{acf1}: around -0.10 to 0.10 after warm-up
+\end{itemize}
+
+Outlier events are shown in Table~\ref{tab:diag-spikes}.
+
+\begin{table}[t]
+\centering
+\begin{tabular}{lccccc}
+\toprule
+Location & \texttt{pred\_std} & \texttt{volatility\_loss} & \texttt{curvature\_loss} & \texttt{acf1} & Signal \\
+\midrule
+S1 E4 B800 & 0.3732 & 6.1443 & 0.4749 & 0.0307 & vol spike \\
+S2 E2 B1400 & 0.7764 & 5.7370 & 0.5018 & -0.0831 & var+vol spike \\
+S2 E6 B200 & 2.0998 & 4.4160 & 0.6012 & 0.0120 & variance explosion \\
+S3 E5 B200 & 0.3331 & 6.1808 & 0.4307 & 0.0199 & vol spike \\
+S3 E8 B1400 & 4.1262 & 2.3910 & 0.7158 & -0.0005 & major variance burst \\
+\bottomrule
+\end{tabular}
+\caption{Representative instability events from batch diagnostics.}
+\label{tab:diag-spikes}
+\end{table}
+
+These spikes suggest transient mini-batch regime mismatch rather than sustained divergence, because epoch-level validation continues to improve and directional accuracy remains stable. The curvature term acts as a structural brake: even in variance bursts, curvature generally remains bounded below 0.72.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.92\linewidth}{
+\centering
+Placeholder Figure 2: Training pipeline flow.\\
+TimescaleDB window extraction $\rightarrow$ feature tensors $\rightarrow$ staged loader $\rightarrow$ mixed-precision optimizer $\rightarrow$ checkpoint and diagnostics.
+}}
+\caption{Training pipeline with staged data expansion and telemetry logging.}
+\label{fig:pipeline}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.92\linewidth}{
+\centering
+Placeholder Figure 3: Loss and diagnostics evolution curves.\\
+Plot stage/epoch trends for train loss, validation loss, \texttt{pred\_std}, \texttt{volatility\_loss}, and \texttt{acf1}.
+}}
+\caption{Telemetry-based loss and stability evolution.}
+\label{fig:loss-curves}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.92\linewidth}{
+\centering
+Placeholder Figure 4: Predicted vs actual distribution for 7-day horizon.\\
+Overlay histogram or kernel density curves and reliability bins.
+}}
+\caption{Predicted versus actual distribution for calibration inspection.}
+\label{fig:distribution}
+\end{figure}
+
+\section{Training Configuration and Parameter Sensitivity}
+\subsection{Exact Runtime Configuration}
+The model is trained using:
+
+\begin{lstlisting}[language=bash,caption={Production training command for the deployed 7-day model},label={lst:train-command}]
+python train.py --dataset metrics.csv --prices stock_prices.csv --companies companies.csv --horizons 7 --lookback 120 --stages 3 --stage_ratios 0.2,0.6,1.0 --verify_split 0.15 --batch_size 128 --min_batch_size 64 --max_batch_size 512 --epochs_per_stage 14 --learning_rate 0.00035 --patience 4 --accum_steps 2 --stride 2 --num_workers 2 --prefetch_factor 2 --cpu_prefetch_queue 3 --device cuda --mixed_precision true --iterative_training true --mode high_throughput --auto_batch_size true --enable_gpu_prefetch true --channels_last false --profile false --checkpoint_dir models/ --log_dir logs/ --output_dir output_model/
+\end{lstlisting}
+
+\subsection{Parameter-by-Parameter Interpretation}
+\begin{longtable}{p{0.17\linewidth}p{0.24\linewidth}p{0.24\linewidth}p{0.24\linewidth}}
+\toprule
+Parameter & Optimization role & Throughput role & Convergence impact \\
+\midrule
+\endfirsthead
+\toprule
+Parameter & Optimization role & Throughput role & Convergence impact \\
+\midrule
+\endhead
+\texttt{dataset} & Defines feature source & Controls I/O volume & Affects feature quality and bias \\
+\texttt{prices} & Provides targets and anchors & Sequential read cost & Misalignment degrades supervision \\
+\texttt{companies} & Symbol mapping consistency & Small lookup overhead & Prevents symbol leakage errors \\
+\texttt{horizons=7} & Single-objective gradient & Smaller output head & Removes multi-task interference \\
+\texttt{lookback=120} & Context span for sequence memory & Larger tensor length & Balances signal depth vs noise \\
+\texttt{stages=3} & Curriculum optimization & Repeated passes with expansion & Stabilizes early training \\
+\texttt{stage\_ratios} & Progressive data exposure & Controls batch count per stage & Reduces early overfit risk \\
+\texttt{verify\_split=0.15} & Validation pressure & Extra evaluation compute & Earlier detection of drift \\
+\texttt{batch\_size=128} & Baseline gradient variance & Core GPU occupancy control & Too small is noisy, too large is rigid \\
+\texttt{min\_batch\_size=64} & Lower bound for stability & Prevents underutilization collapse & Protects noisy updates \\
+\texttt{max\_batch\_size=512} & Upper bound for generalization & Caps memory pressure & Avoids flat minima over-sharpening \\
+\texttt{epochs\_per\_stage=14} & Update budget per stage & Runtime multiplier & Too few underfit, too many overfit \\
+\texttt{learning\_rate=0.00035} & Step size control & Indirect via failed steps & Critical for stable descent \\
+\texttt{patience=4} & Early-stop trigger & Saves wasted epochs & Avoids late-stage degradation \\
+\texttt{accum\_steps=2} & Effective batch increase & Lower VRAM demand than true large batch & Smooths gradients without OOM \\
+\texttt{stride=2} & Sample de-correlation & Fewer windows and faster epochs & Slightly less data, often better robustness \\
+\texttt{num\_workers=2} & None directly & CPU loader parallelism & Too high can increase jitter \\
+\texttt{prefetch\_factor=2} & None directly & Hides data latency & Low prefetch can starve GPU \\
+\texttt{cpu\_prefetch\_queue=3} & None directly & Buffers batch delivery & Smooths CPU-GPU transfer gaps \\
+\texttt{device=cuda} & Enables GPU kernels & Major speedup for attention/GRU & Allows larger effective capacity \\
+\texttt{mixed\_precision=true} & Dynamic loss scaling path & Tensor core acceleration & Needs scale control for stability \\
+\texttt{iterative\_training=true} & Warm continuation between stages & Fewer cold restarts & Improves stage-to-stage consistency \\
+\texttt{mode=high\_throughput} & Throughput-oriented kernel path & Better occupancy and overlap & Can reduce wall-time overfit \\
+\texttt{auto\_batch\_size=true} & Adaptive gradient noise control & Occupancy tuning under VRAM limits & Prevents OOM-induced restarts \\
+\texttt{enable\_gpu\_prefetch=true} & None directly & Overlaps transfer and compute & Reduces step-time variance \\
+\texttt{channels\_last=false} & Keeps default memory layout & Avoids layout conversion overhead & Neutral for this sequence model \\
+\texttt{profile=false} & No profiling perturbation & Avoids tracing overhead & Keeps training dynamics unperturbed \\
+\texttt{checkpoint\_dir} & Persists optimizer/model state & Minor write overhead & Enables rollback and best-model restore \\
+\texttt{log\_dir} & Persists telemetry & Minor write overhead & Supports diagnosis and ablation \\
+\texttt{output\_dir} & Exports inference artifacts & Post-training I/O & Ensures deployment reproducibility \\
+\bottomrule
+\end{longtable}
+
+\subsection{Sensitivity Discussion}
+Observed sensitivity in this run is strongest for \texttt{learning\_rate}, \texttt{lookback}, and \texttt{batch\_size bounds}. Instability bursts in \texttt{pred\_std} co-occur with volatility spikes, indicating that adaptive batch and accumulation settings are essential. The selected \texttt{patience=4} is aggressive enough to limit late-stage drift while still permitting stage 3 improvements.
+
+\section{Training Pipeline Mechanics}
+\subsection{Gradient Accumulation}
+With accumulation factor $k$:
+\begin{equation}
+g = \sum_{i=1}^{k} \nabla \mathcal{L}_i,
+\end{equation}
+\begin{equation}
+\theta_{t+1} = \theta_t - \eta \frac{g}{k}.
+\end{equation}
+
+\subsection{Mixed Precision Scaling}
+Let $s$ be dynamic scale. Backpropagation uses
+\begin{equation}
+\tilde{\mathcal{L}} = s \mathcal{L}, \quad
+\nabla\mathcal{L}=\frac{1}{s}\nabla\tilde{\mathcal{L}}.
+\end{equation}
+This reduces underflow while preserving update direction.
+
+\subsection{Stage-Based Expansion}
+If total windows are $N$, stage ratio $r_j$ uses
+\begin{equation}
+N_j = \lfloor r_j N \rfloor, \quad r_j \in \{0.2,0.6,1.0\}.
+\end{equation}
+The strategy reduces optimization shock by introducing data complexity progressively.
+
+\section{Hardware-Aware Analysis}
+\subsection{Platform}
+\begin{table}[t]
+\centering
+\begin{tabular}{ll}
+\toprule
+Component & Specification \\
+\midrule
+CPU & AMD Ryzen 7 7435HS \\
+GPU & NVIDIA RTX 4060 Laptop \\
+RAM & 16 GB \\
+\bottomrule
+\end{tabular}
+\caption{Training hardware environment.}
+\label{tab:hardware}
+\end{table}
+
+\subsection{Utilization and Transfer Behavior}
+Epoch telemetry indicates:
+\begin{itemize}
+\item \texttt{gpu\_util\_est\_pct} rises from 42.67\% (warm-up) to about 46.6\% steady-state.
+\item \texttt{data\_wait\_pct} drops from 8.85\% to about 1.02\% after loader warm-up.
+\item Effective batch size stabilizes at 512, implying successful auto-scaling with accumulation.
+\end{itemize}
+
+These values confirm that \texttt{num\_workers=2}, \texttt{prefetch\_factor=2}, and GPU prefetching are enough to prevent sustained input starvation on this laptop-class GPU.
+
+\subsection{Gradient Accumulation versus VRAM}
+Large true batches can exceed VRAM during Transformer and GRU combined workloads. Accumulation preserves update smoothness while retaining feasible memory usage. In this run, accumulation contributes to stability during stage transitions without sacrificing throughput.
+
+\section{Required Algorithms}
+\subsection{Algorithm 1: Training Loop}
+\begin{lstlisting}[language=Python,caption={Pseudo-code for mixed-precision staged training loop},label={lst:algo-train}]
+for stage, ratio in enumerate(stage_ratios):
+    subset = build_dataset_subset(full_dataset, ratio)
+    loader = make_loader(subset, auto_batch_size=True)
+    best_val = +inf
+    bad_epochs = 0
+
+    for epoch in range(epochs_per_stage):
+        optimizer.zero_grad()
+        for batch_idx, batch in enumerate(loader):
+            with autocast(enabled=mixed_precision):
+                pred = model(batch.x)
+                loss_reg = regression_loss(pred, batch.y)
+                loss_vol = volatility_alignment(pred, batch.y)
+                loss_curv = curvature_penalty(pred)
+                loss = l1*loss_reg + l2*loss_vol + l3*loss_curv
+
+            scaler.scale(loss / accum_steps).backward()
+
+            if (batch_idx + 1) % accum_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            log_batch_diag(pred_mean=pred.mean(), pred_std=pred.std(),
+                           volatility_loss=loss_vol, curvature_loss=loss_curv,
+                           acf1=lag1_autocorr(pred))
+
+        val = evaluate(model, val_loader)
+        if val < best_val:
+            save_checkpoint(model)
+            best_val = val
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+            if bad_epochs >= patience:
+                break
+\end{lstlisting}
+
+\subsection{Algorithm 2: Stage-Based Dataset Expansion}
+\begin{lstlisting}[language=Python,caption={Pseudo-code for progressive stage expansion},label={lst:algo-stage}]
+def build_dataset_subset(dataset, ratio):
+    n_total = len(dataset)
+    n_use = int(ratio * n_total)
+    # chronological slicing preserves causality
+    subset = dataset[:n_use]
+    return subset
+
+stage_ratios = [0.2, 0.6, 1.0]
+for ratio in stage_ratios:
+    stage_data = build_dataset_subset(train_data, ratio)
+    train_one_stage(stage_data)
+\end{lstlisting}
+
+\subsection{Algorithm 3: Inference Pipeline}
+\begin{lstlisting}[language=Python,caption={Pseudo-code for online inference path},label={lst:algo-infer}]
+def predict_7d(symbol):
+    cached = redis_get(f"pred:{symbol}:7d")
+    if cached is not None:
+        return cached
+
+    rows = timescaledb_fetch_recent(symbol, lookback=120)
+    x = feature_pipeline(rows)
+    y_seq = seq_model(x)          # Transformer + Attention + GRU
+    y_res = lightgbm_residual(x)  # tabular correction
+    y_hat = y_seq + gamma * y_res
+
+    redis_setex(f"pred:{symbol}:7d", y_hat, ttl=3600)
+    return y_hat
+\end{lstlisting}
+
+\section{System Integration Analysis}
+\subsection{Celery and Training Jobs}
+Celery isolates long-running jobs (retraining, backfill, feature rebuild) from online API latency. Queue-based isolation prevents model retraining from blocking websocket response traffic.
+
+\subsection{Redis and Inference Caching}
+Redis stores short-horizon prediction and summary responses, reducing repeated model execution for hot symbols. A read-through policy keeps median latency low while preserving bounded staleness.
+
+\subsection{TimescaleDB and Sliding Windows}
+TimescaleDB is used as the window source of truth. Chronological retrieval plus deterministic joins produce leakage-safe tensors for training and inference. This ensures consistency between what the model sees online and what it saw during fitting.
+
+\section{Discussion}
+The telemetry suggests a model that is mostly calibrated with occasional high-variance bursts. The key point is that these bursts are sparse and not coupled to sustained validation degradation. The current regularization stack successfully contains instability while still allowing directional performance gains.
+
+The new self-implemented SessionMemory component addresses a separate but critical production issue: prompt-context drift in conversational workflows. By storing semantically compressed client and backend messages, the assistant can maintain session continuity without linear growth in prompt tokens.
+
+\section{Conclusion}
+This paper presented a full-stack, production-focused stock forecasting platform grounded in real telemetry and mathematical analysis. The architecture is capable of multi-horizon forecasting but is intentionally deployed in a 7-day mode due to measurable optimization stability and operations simplicity.
+
+The integration of the self-implemented SessionMemory module adds a robust compressed-memory layer for all client and backend messages, improving continuity for AI-assisted analytics. Empirical diagnostics, including \texttt{pred\_std}, \texttt{volatility\_loss}, \texttt{curvature\_loss}, and \texttt{acf1}, support the selected objective design and runtime configuration on the target hardware profile.
+
+Future work should revisit controlled multi-horizon deployment once gradient interference mitigation (for example, projection or gradient surgery) is integrated and validated against the same telemetry protocol.
+
+\end{document}

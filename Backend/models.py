@@ -41,11 +41,15 @@ class SummaryResponse(BaseModel):
 
 class PredictionPoint(BaseModel):
     date: str
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
     close: float
 
 class PredictionResponse(BaseModel):
     available: bool
     message: Optional[str] = "Model training in progress or not yet integrated."
+    model_used: Optional[str] = None
     trend: Optional[str] = None
     confidence: Optional[float] = None
     top_features: Optional[List[Dict[str, Any]]] = None
