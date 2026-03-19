@@ -2,28 +2,22 @@ import os
 import json
 import time
 import re
+import math
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from google import genai
 
-GEMINI_TOKEN_ENV_KEYS = ("GEMINI_API_KEYS", "GEMINI_API_KEY")
+GEMINI_TOKEN_ENV_KEY = "GEMINI_API_KEY"
 FALLBACK_GEMINI_TOKEN = "dummy"
 
 
-def _parse_token_pool(raw_value: str) -> list[str]:
-    return [token.strip() for token in (raw_value or "").split(",") if token.strip()]
+def _load_token() -> str:
+    token = os.environ.get(GEMINI_TOKEN_ENV_KEY, "").strip()
+    if token:
+        return token
 
-
-def _load_token_pool() -> list[str]:
-    # Prefer already-exported environment variables (e.g. docker compose injection).
-    for key in GEMINI_TOKEN_ENV_KEYS:
-        tokens = _parse_token_pool(os.environ.get(key, ""))
-        if tokens:
-            return tokens
-
-    # Fallback for local direct runs where .env exists but isn't injected.
     env_path = Path(__file__).resolve().parent.parent / ".env"
     if env_path.exists():
         try:
@@ -32,20 +26,20 @@ def _load_token_pool() -> list[str]:
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 if line.startswith("export "):
-                    line = line[len("export ") :].strip()
+                    line = line[len("export "):].strip()
 
                 key, value = line.split("=", 1)
-                if key.strip() not in GEMINI_TOKEN_ENV_KEYS:
+                if key.strip() != GEMINI_TOKEN_ENV_KEY:
                     continue
 
-                clean_value = value.strip().strip("\"").strip("'")
-                tokens = _parse_token_pool(clean_value)
-                if tokens:
-                    return tokens
+                token = value.strip().strip('"').strip("'")
+                if token:
+                    return token
         except Exception:
             pass
 
-    return [FALLBACK_GEMINI_TOKEN]
+    return FALLBACK_GEMINI_TOKEN
+
 
 class SessionMemory:
     """
@@ -97,7 +91,7 @@ class SessionMemory:
             self._sessions[token].append(entry)
 
     def get_history(self, token: str, current_query: str = "") -> str:
-        _ = current_query  # Reserved for future prioritization.
+        _ = current_query
 
         with self._lock:
             entries = list(self._sessions.get(token, []))
@@ -121,65 +115,175 @@ class SessionMemory:
         with self._lock:
             self._sessions.pop(token, None)
 
+
 # Global in-house session memory instance
 session_memory_store = SessionMemory()
+
 
 class AIGateway:
     """
     Centralized AI routing service.
-    Handles token pooling and Gemini request retries.
+    Handles a single Gemini token with rate limiting and quota handling.
     """
+
     def __init__(self):
-        self._pool_lock = RLock()
-        self._token_pool = _load_token_pool()
-        self._token_index = 0
-        self._gemini_clients: dict[str, genai.Client] = {}
+        self._rate_lock = RLock()
+        self._request_lock = RLock()
+        self._api_token = _load_token()
+        self._next_allowed_request_ts = 0.0
+        self._min_request_interval_s = self._read_float_env(
+            "GEMINI_MIN_REQUEST_INTERVAL_SECONDS",
+            2.0,
+            minimum=0.0,
+        )
+        self._quota_lock = RLock()
+        self._quota_cooldown_seconds = self._read_float_env(
+            "GEMINI_QUOTA_COOLDOWN_SECONDS",
+            55.0,
+            minimum=0.0,
+        )
+        self._quota_blocked_until_ts = 0.0
         self.gemini_client = None
         self._init_gemini()
 
-    def _init_gemini(self):
-        # Pre-warm at least one client, while keeping full lazy round-robin creation.
-        self.gemini_client = None
-        for token in self._token_pool:
-            client = self._get_or_create_client(token)
-            if client:
-                self.gemini_client = client
-                break
-
-        # Start rotation from the first token on the first live request.
-        with self._pool_lock:
-            self._token_index = 0
-
-    def _next_token(self) -> str:
-        with self._pool_lock:
-            if not self._token_pool:
-                return ""
-
-            token = self._token_pool[self._token_index]
-            self._token_index = (self._token_index + 1) % len(self._token_pool)
-            return token
-
-    def _get_or_create_client(self, token: str):
-        with self._pool_lock:
-            cached_client = self._gemini_clients.get(token)
-        if cached_client is not None:
-            return cached_client
-
+    def _read_float_env(self, name: str, default: float, minimum: float = 0.0) -> float:
+        raw = os.environ.get(name, str(default))
         try:
-            client = genai.Client(api_key=token)
-        except Exception as e:
-            print(f"[AIGateway] Error initializing Gemini client for token pool entry: {e}")
+            value = float(raw)
+            if value < minimum:
+                return default
+            return value
+        except (TypeError, ValueError):
+            return default
+
+    def _wait_for_request_slot(self):
+        if self._min_request_interval_s <= 0:
+            return
+
+        with self._rate_lock:
+            now = time.monotonic()
+            wait_time = self._next_allowed_request_ts - now
+            if wait_time > 0:
+                time.sleep(wait_time)
+            self._next_allowed_request_ts = time.monotonic() + self._min_request_interval_s
+
+    def _extract_retry_after_seconds(self, err: Exception) -> float:
+        response = getattr(err, "response", None)
+        if response is not None:
+            headers = getattr(response, "headers", {}) or {}
+            header_value = headers.get("Retry-After") or headers.get("retry-after")
+            parsed_header = self._parse_retry_after_seconds(header_value)
+            if parsed_header is not None:
+                return parsed_header
+
+        text = str(err)
+        for pattern in (
+            r"retry\s*after\s*[:=]?\s*(\d+(?:\.\d+)?)\s*s",
+            r"retry\s*after\s*[:=]?\s*(\d+(?:\.\d+)?)",
+            r"retryDelay\"?\s*[:=]\s*\"?(\d+(?:\.\d+)?)s?",
+        ):
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            try:
+                return max(0.0, float(match.group(1)))
+            except (TypeError, ValueError):
+                continue
+
+        return 0.0
+
+    def _is_throttled_error(self, err: Exception) -> bool:
+        err_text = str(err)
+        err_upper = err_text.upper()
+        return (
+            "429" in err_text
+            or "RESOURCE_EXHAUSTED" in err_upper
+            or "TOO MANY REQUESTS" in err_upper
+            or "RATE LIMIT" in err_upper
+        )
+
+    def _is_quota_exhausted_error(self, err: Exception) -> bool:
+        err_upper = str(err).upper()
+        quota_markers = (
+            "QUOTA EXCEEDED",
+            "CHECK YOUR PLAN AND BILLING DETAILS",
+            "GENERATIVELANGUAGE.GOOGLEAPIS.COM/GENERATE_CONTENT_FREE_TIER_REQUESTS",
+            "GENERATEREQUESTSPERDAYPERPROJECTPERMODEL-FREETIER",
+            "FREETIER",
+            "PERDAY",
+        )
+        if "RESOURCE_EXHAUSTED" in err_upper and "QUOTA" in err_upper:
+            return True
+        return any(marker in err_upper for marker in quota_markers)
+
+    def _start_quota_cooldown(self, err: Exception):
+        retry_after = self._extract_retry_after_seconds(err)
+        delay = max(self._quota_cooldown_seconds, retry_after)
+        if delay <= 0:
+            return
+
+        with self._quota_lock:
+            candidate_until = time.monotonic() + delay
+            if candidate_until > self._quota_blocked_until_ts:
+                self._quota_blocked_until_ts = candidate_until
+
+    def _quota_cooldown_remaining_seconds(self) -> float:
+        with self._quota_lock:
+            remaining = self._quota_blocked_until_ts - time.monotonic()
+            if remaining <= 0:
+                self._quota_blocked_until_ts = 0.0
+                return 0.0
+            return remaining
+
+    def _build_limit_message(
+        self,
+        err: Exception | None = None,
+        precomputed_retry_after: float | None = None,
+    ) -> str:
+        retry_after = (
+            precomputed_retry_after
+            if precomputed_retry_after is not None
+            else self._extract_retry_after_seconds(err) if err is not None else 0.0
+        )
+        if retry_after <= 0:
+            retry_after = self._quota_cooldown_remaining_seconds()
+
+        retry_hint = ""
+        if retry_after > 0:
+            retry_hint = f" Please retry in about {int(math.ceil(retry_after))} seconds."
+
+        if err is not None and self._is_quota_exhausted_error(err):
+            return (
+                "The AI service quota is exhausted for the current Gemini project."
+                + retry_hint
+                + " Try another API key/project or wait for quota reset."
+            )
+
+        if err is not None and self._is_throttled_error(err):
+            return "The AI service is temporarily rate-limited." + retry_hint
+
+        if retry_after > 0:
+            return "The AI service is temporarily unavailable due to recent quota limits." + retry_hint
+
+        return "The AI service is temporarily unavailable. Please try again shortly."
+
+    def _parse_retry_after_seconds(self, value) -> float | None:
+        if value is None:
             return None
+        try:
+            parsed = float(str(value).strip())
+            if parsed >= 0:
+                return parsed
+        except (TypeError, ValueError):
+            return None
+        return None
 
-        with self._pool_lock:
-            self._gemini_clients[token] = client
-        return client
-
-    def _next_gemini_agent(self):
-        token = self._next_token()
-        if not token:
-            return "", None
-        return token, self._get_or_create_client(token)
+    def _init_gemini(self):
+        try:
+            self.gemini_client = genai.Client(api_key=self._api_token)
+        except Exception as e:
+            print(f"[AIGateway] Error initializing Gemini client: {e}")
+            self.gemini_client = None
 
     def _extract_analysis_mode(self, query: str) -> tuple[str, str]:
         if not query:
@@ -264,43 +368,32 @@ class AIGateway:
             f"{', '.join(top_features)}. Provide an assertive, professional explanation."
             f"CURRENCY RULE: Format any currency in thousands of VNĐ (e.g., 22.3 becomes 22,300 VNĐ)."
         )
-        return self.route_request(prompt, lightweight=True)
+        return self.route_request(prompt)
 
     def route_request(self, prompt: str, lightweight: bool = True) -> str:
-        """Routes requests to Gemini with retry/backoff on throttling."""
-        _ = lightweight  # Kept for backward compatibility with existing callers.
+        """Routes a request to the single configured Gemini token."""
+        _ = lightweight
 
-        if not self._token_pool:
-            return "System Error: Gemini token pool is empty."
-            
-        last_error = None
-        max_attempts = max(3, len(self._token_pool))
+        cooldown_remaining = self._quota_cooldown_remaining_seconds()
+        if cooldown_remaining > 0:
+            return self._build_limit_message(precomputed_retry_after=cooldown_remaining)
+
+        if not self.gemini_client:
+            return "System Error: Gemini client is not initialized."
+
         try:
-            for attempt in range(max_attempts):
-                _, agent_client = self._next_gemini_agent()
-                if not agent_client:
-                    last_error = RuntimeError("Gemini client is not initialized for selected token.")
-                    continue
-
-                try:
-                    response = agent_client.models.generate_content(
-                        model='gemini-2.5-flash', 
-                        contents=["You are a specialized financial AI.", prompt]
-                    )
-                    return response.text
-                except Exception as api_err:
-                    last_error = api_err
-                    if "429" in str(api_err) and attempt < (max_attempts - 1):
-                        time.sleep(2 ** min(attempt, 4))  # Exponential backoff with sane cap
-                        continue
-                    if any(code in str(api_err) for code in ("401", "403")) and attempt < (max_attempts - 1):
-                        continue
-
-            if last_error:
-                return f"Agent Runtime Error: {str(last_error)}"
-            return "Agent Runtime Error: Gemini request failed with no detailed error."
-        except Exception as e:
-            return f"Agent Runtime Error: {str(e)}"
+            with self._request_lock:
+                self._wait_for_request_slot()
+                response = self.gemini_client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=["You are a specialized financial AI.", prompt]
+                )
+            return response.text
+        except Exception as api_err:
+            print(f"[AIGateway] Gemini request failed: {api_err}")
+            if self._is_quota_exhausted_error(api_err):
+                self._start_quota_cooldown(api_err)
+            return self._build_limit_message(api_err)
 
     def answer_chat_query(self, sid: str, query: str, context: str = "") -> str:
         """
@@ -311,7 +404,7 @@ class AIGateway:
         context_compare = ""
         context_graph = ""
         normalized_query, analysis_mode = self._extract_analysis_mode(query)
-        
+
         try:
             if context:
                 ctx_data = json.loads(context)
@@ -320,10 +413,9 @@ class AIGateway:
                 context_graph = ctx_data.get("graph_data", "")
         except Exception:
             pass
-            
-        # Retrieve recent in-process session history for contextual awareness
+
         history = session_memory_store.get_history(sid, current_query=normalized_query)
-        
+
         elegant_payload = f"User asked: '{normalized_query}'\n"
         if history:
             elegant_payload = history + elegant_payload
@@ -344,7 +436,14 @@ class AIGateway:
             f"Context and Query:\n{elegant_payload}\n\n"
             "Reply with ONLY the exact word 'MODE_A', 'MODE_B', 'MODE_C', or 'IRRELEVANT'."
         )
-        route = self.route_request(router_prompt, lightweight=False).strip().upper()
+        route_raw = self.route_request(router_prompt).strip()
+        route = route_raw.upper()
+
+        route_label = ""
+        for candidate in ("MODE_A", "MODE_B", "MODE_C", "IRRELEVANT"):
+            if candidate in route:
+                route_label = candidate
+                break
 
         TONING_RULE = (
             "CRITICAL GUARDRAILS:\n"
@@ -356,15 +455,19 @@ class AIGateway:
 
         final_response = ""
 
-        if "IRRELEVANT" in route:
+        if not route_label:
+            if any(tag in route for tag in ("429", "RESOURCE_EXHAUSTED", "TOO MANY REQUESTS", "QUOTA", "RATE-LIMIT", "RATE LIMIT")):
+                final_response = route_raw
+            else:
+                final_response = "The AI router is temporarily unavailable. Please retry in a moment."
+
+        elif route_label == "IRRELEVANT":
             final_response = "I'm sorry, but I can only assist you with stock-related questions."
-        
-        elif "MODE_A" in route:
-            # Pure DB Extractor Mode
+
+        elif route_label == "MODE_A":
             final_response = self.query_pandasai(normalized_query, context, context_graph)
 
-        elif "MODE_B" in route:
-            # Hybrid Mode: Contextual Dataset Extraction + Interpretation
+        elif route_label == "MODE_B":
             data_context = self.query_pandasai(normalized_query, context, context_graph)
             hybrid_prompt = self._build_price_only_analysis_prompt(
                 user_query=normalized_query,
@@ -372,19 +475,17 @@ class AIGateway:
                 data_context=data_context,
                 mode=analysis_mode,
             )
-            final_response = self.route_request(hybrid_prompt, lightweight=False)
-            
+            final_response = self.route_request(hybrid_prompt)
+
         else:
-            # MODE_C: General Knowledge / Fundamentals / Educational with strong Assertive Guardrails
             general_prompt = (
                 f"You are a helpful, assertive stock market assistant.\n"
                 f"{elegant_payload}\n"
                 f"CRITICAL GUARDRAIL: Never fabricate, invent, or estimate fundamental data.\n"
                 f"{TONING_RULE}"
             )
-            final_response = self.route_request(general_prompt, lightweight=False)
+            final_response = self.route_request(general_prompt)
 
-        # Persist both client and backend messages into in-process session memory.
         session_memory_store.add_message(
             sid,
             "client",
@@ -399,35 +500,143 @@ class AIGateway:
             sid,
             "backend",
             final_response,
-            metadata={"route": route},
+            metadata={"route": route_label or route},
         )
 
         return final_response
+
+    def _is_safe_symbol(self, symbol: str) -> bool:
+        return bool(re.fullmatch(r"[A-Z0-9._-]{1,10}", (symbol or "").upper()))
+
+    def _extract_symbol_hint(self, query: str, context: str = "") -> str:
+        text_chunks = [query or ""]
+        if context:
+            try:
+                ctx_data = json.loads(context)
+                text_chunks.append(ctx_data.get("details", ""))
+                text_chunks.append(ctx_data.get("compare", ""))
+            except Exception:
+                pass
+
+        haystack = " ".join(text_chunks).upper()
+        explicit_patterns = (
+            r"\b(?:STOCK|TICKER|SYMBOL)\s*[:=\-]?\s*([A-Z][A-Z0-9._-]{1,9})\b",
+            r"\bFOR\s+([A-Z][A-Z0-9._-]{1,9})\b",
+        )
+        for pattern in explicit_patterns:
+            match = re.search(pattern, haystack)
+            if not match:
+                continue
+            candidate = match.group(1).upper()
+            if self._is_safe_symbol(candidate):
+                return candidate
+
+        blacklist = {
+            "MODE", "MODE_A", "MODE_B", "MODE_C", "RSI", "MACD", "ADX", "ATR",
+            "EMA", "EMA20", "MA", "MA20", "MA50", "OHLCV", "VNĐ", "VND", "USD",
+        }
+        for token in re.findall(r"\b[A-Z][A-Z0-9._-]{1,9}\b", haystack):
+            if token in blacklist:
+                continue
+            if self._is_safe_symbol(token):
+                return token
+
+        return ""
+
+    def _format_thousand_vnd(self, value) -> str:
+        try:
+            number = float(value)
+            if number != number:
+                return "N/A"
+            return f"{number * 1000:,.0f} VNĐ"
+        except (TypeError, ValueError):
+            return "N/A"
+
+    def _format_decimal(self, value, decimals: int = 2) -> str:
+        try:
+            number = float(value)
+            if number != number:
+                return "N/A"
+            return f"{number:,.{decimals}f}"
+        except (TypeError, ValueError):
+            return "N/A"
+
+    def _safe_stock_details_with_execute_sql_query(self, df_prices, df_metrics, symbol: str) -> str:
+        safe_symbol = (symbol or "").strip().upper()
+        if not self._is_safe_symbol(safe_symbol):
+            return ""
+
+        price_query = (
+            "SELECT time, open, high, low, close, volume "
+            "FROM stock_prices "
+            f"WHERE symbol = '{safe_symbol}' "
+            "ORDER BY time DESC "
+            "LIMIT 1"
+        )
+        metrics_query = (
+            "SELECT time, ma20, ma50, ema20, rsi, macd, atr, adx, bb_width "
+            "FROM metrics "
+            f"WHERE symbol = '{safe_symbol}' "
+            "ORDER BY time DESC "
+            "LIMIT 1"
+        )
+
+        try:
+            price_df = df_prices.execute_sql_query(price_query)
+        except Exception:
+            return f"Could not retrieve details for stock '{safe_symbol}'."
+
+        if price_df is None or getattr(price_df, "empty", True):
+            return f"Could not retrieve details for stock '{safe_symbol}'."
+
+        latest_price = price_df.iloc[0]
+        details = [
+            f"Stock details for {safe_symbol} ({latest_price.get('time', 'N/A')}):",
+            f"- Open: {self._format_thousand_vnd(latest_price.get('open'))}",
+            f"- High: {self._format_thousand_vnd(latest_price.get('high'))}",
+            f"- Low: {self._format_thousand_vnd(latest_price.get('low'))}",
+            f"- Close: {self._format_thousand_vnd(latest_price.get('close'))}",
+            f"- Volume: {self._format_decimal(latest_price.get('volume'), 0)}",
+        ]
+
+        try:
+            metrics_df = df_metrics.execute_sql_query(metrics_query)
+            if metrics_df is not None and not getattr(metrics_df, "empty", True):
+                latest_metrics = metrics_df.iloc[0]
+                details.extend(
+                    [
+                        "- Indicators:",
+                        f"  MA20: {self._format_thousand_vnd(latest_metrics.get('ma20'))}",
+                        f"  MA50: {self._format_thousand_vnd(latest_metrics.get('ma50'))}",
+                        f"  EMA20: {self._format_thousand_vnd(latest_metrics.get('ema20'))}",
+                        f"  RSI: {self._format_decimal(latest_metrics.get('rsi'))}",
+                        f"  MACD: {self._format_decimal(latest_metrics.get('macd'), 4)}",
+                        f"  ATR: {self._format_decimal(latest_metrics.get('atr'), 4)}",
+                        f"  ADX: {self._format_decimal(latest_metrics.get('adx'))}",
+                        f"  BB Width: {self._format_decimal(latest_metrics.get('bb_width'), 4)}",
+                    ]
+                )
+        except Exception:
+            pass
+
+        return "\n".join(details)
 
     def query_pandasai(self, query: str, context: str = "", context_graph: str = "") -> str:
         try:
             import pandasai as pai
             from pandasai import Agent
             from pandasai_litellm.litellm import LiteLLM
-            
+
             db_connection = {
                 "host": "db",
-                "port": 15432, 
-                "user": "admin", 
+                "port": 15432,
+                "user": "admin",
                 "password": "hypestock_password_idk",
                 "database": "stock_data"
             }
 
-            # PandasAI v3 semantic paths require slug-safe organization/model names.
             semantic_org = "stock-data"
-            
-            api_token = self._next_token()
-            if not api_token:
-                return "System Error: Gemini token pool is empty."
 
-            llm = LiteLLM(model="gemini/gemini-2.5-flash", api_key=api_token)
-            
-            # Using PandasAI v3 Semantic Data Extensions for Postgres
             df_companies = pai.create(
                 path=f"{semantic_org}/companies",
                 description="Contains company stock symbols and names.",
@@ -495,12 +704,22 @@ class AIGateway:
                     ]
                 }
             )
-            
+
+            symbol_hint = self._extract_symbol_hint(query, context)
+            is_detail_lookup = bool(
+                symbol_hint
+                and re.search(r"\b(details?|snapshot|overview|latest|current|summary)\b", query, flags=re.IGNORECASE)
+            )
+            if is_detail_lookup:
+                safe_details = self._safe_stock_details_with_execute_sql_query(df_prices, df_metrics, symbol_hint)
+                if safe_details:
+                    return safe_details
+
             context_injection = (
                 f"\n\n--- PLATFORM METADATA & DATASET SCOPE INSTRUCTIONS ---\n"
                 f"You have access to 3 datasets: 'companies' (stock symbols and names), 'stock_prices' (daily OHLCV), and 'metrics' (technical indicators).\n"
             )
-            
+
             try:
                 if context:
                     ctx_data = json.loads(context)
@@ -517,25 +736,40 @@ class AIGateway:
                         context_injection += "Use this context if the user implies \"this stock\" or \"these stocks\".\n"
             except Exception:
                 pass
-            
-            # Toning formatting override for PandasAI raw responses
+
             context_injection += (
                 "\n- CRITICAL FORMATTING: From what I can tell, convert any price or currency values to thousands of VNĐ by "
                 "multiplying by 1000 and appending 'VNĐ' (e.g., 22.3 becomes 22,300 VNĐ).\n"
             )
-
-            agent = Agent(
-                [df_companies, df_prices, df_metrics],
-                config={
-                    "llm": llm,
-                    "verbose": False,
-                    "enable_cache": False
-                }
+            context_injection += (
+                "- SQL SAFETY: If SQL is required, use execute_sql_query with a single SELECT statement only. "
+                "Never generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, UNION, or multiple statements in one query.\n"
             )
-            
-            response = agent.chat(query + context_injection)
-            return str(response)
-            
+
+            cooldown_remaining = self._quota_cooldown_remaining_seconds()
+            if cooldown_remaining > 0:
+                return self._build_limit_message(precomputed_retry_after=cooldown_remaining)
+
+            try:
+                llm = LiteLLM(model="gemini/gemini-2.5-flash", api_key=self._api_token)
+                agent = Agent(
+                    [df_companies, df_prices, df_metrics],
+                    config={
+                        "llm": llm,
+                        "verbose": False,
+                        "enable_cache": False
+                    }
+                )
+
+                with self._request_lock:
+                    self._wait_for_request_slot()
+                    response = agent.chat(query + context_injection)
+                return str(response)
+            except Exception as agent_err:
+                if self._is_quota_exhausted_error(agent_err):
+                    self._start_quota_cooldown(agent_err)
+                raise
+
         except Exception as e:
             print(f"[AIGateway] PandasAI Error: {e}")
             return self.route_request(
@@ -544,8 +778,8 @@ class AIGateway:
                 f"CRITICAL GUARDRAILS:\n"
                 f"1. Do not explicitly state the lack of a dataset. Instead, assertively state that the platform only shows price data, and that users should not base their decision alone on this.\n"
                 f"2. Convert currency to thousands of VNĐ (e.g., 22.3 to 22,300 VNĐ).",
-                lightweight=False
             )
+
 
 # Singleton instance
 ai_gateway = AIGateway()

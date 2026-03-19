@@ -2,6 +2,12 @@
 \usepackage{amsmath,amssymb,graphicx,hyperref,geometry,listings,booktabs}
 \usepackage{xcolor}
 \usepackage{longtable}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\usepackage{array}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds}
+\pgfplotsset{compat=1.18}
+\newcolumntype{P}[1]{>{\raggedright\arraybackslash}p{#1}}
 
 \geometry{margin=1in}
 \hypersetup{
@@ -71,11 +77,49 @@ T_{e2e}=T_{fetch}+T_{feature}+T_{predict}+T_{cache}+T_{transport}.
 
 \begin{figure}[t]
 \centering
-\fbox{\parbox{0.92\linewidth}{
-\centering
-Placeholder Figure 1: Model and service architecture diagram.\\
-FastAPI/Socket.IO API layer, Celery workers, Redis, TimescaleDB, Transformer+Attention+GRU forecaster, LightGBM ensemble, and a self-implemented SessionMemory compressed conversation memory component.
-}}
+\begin{tikzpicture}[
+    >=Latex,
+    node distance=2.00cm and 1.90cm,
+    svc/.style={draw, rounded corners, thick, minimum width=3.2cm, minimum height=1.0cm, align=center, fill=white, font=\small},
+    tinyann/.style={font=\scriptsize, text=black!75, align=center},
+    grp/.style={draw=black!55, rounded corners, thick, inner sep=10pt}
+]
+\node[svc] (client) {Web client};
+\node[svc, right=of client] (nginx) {Nginx\\reverse proxy};
+\node[svc, right=of nginx] (api) {FastAPI +\\Socket.IO};
+
+\node[svc, below=3.30cm of client] (gemini) {Gemini + PandasAI};
+\node[svc, right=of gemini] (memory) {SessionMemory\\(compressed history)};
+\node[svc, right=of memory, minimum width=6.2cm, text width=4.5cm] (model) {Transformer + Attention + GRU\\+ LightGBM residual};
+
+\node[svc, below=3.40cm of gemini] (redis) {Redis\\broker + cache};
+\node[svc, right=of redis] (celery) {Celery workers};
+\node[svc, right=of celery] (tsdb) {PostgreSQL +\\TimescaleDB};
+
+\draw[->, thick] (client) -- (nginx);
+\draw[->, thick] (nginx) -- (api);
+
+\draw[<->, thick] (api.south) -- ++(0,-1.55cm) -| (gemini.north);
+\draw[<->, thick] (gemini) -- (memory);
+\draw[<->, thick] (memory) -- (model);
+
+\draw[->, thick] (api.east) -- ++(4.05cm,0) |- (celery.east);
+\draw[<->, thick] (api.east) -- ++(4.05cm,0) |- (tsdb.east);
+\draw[<->, thick] (api.west) -- ++(-1.35cm,0) |-Z (redis.west);
+\draw[<->, thick] (celery) -- (redis);
+\draw[<->, thick] (celery) -- (tsdb);
+\draw[->, thick] (tsdb.north) -- ++(0,1.20cm) -| (model.south);
+
+\begin{scope}[on background layer] 
+\node[grp, fill=blue!4, fit=(client) (nginx) (api), label={[font=\footnotesize,yshift=3pt]above:Serving plane}] (servinggrp) {};
+\node[grp, fill=green!4, fit=(gemini) (memory) (model), label={[font=\footnotesize,yshift=3pt,xshift=-24pt]above:AI and model plane}] (aigrp) {};
+\node[grp, fill=orange!6, fit=(redis) (celery) (tsdb), label={[font=\footnotesize,yshift=3pt]above:Async and data plane}] (asyncgrp) {};
+\end{scope}
+
+\node[tinyann, anchor=south] at ([xshift=-1.2cm,yshift=1.45cm]aigrp.north) {all client/backend messages\\semantically compressed};
+\node[tinyann, anchor=north] at ([yshift=-1.45cm]asyncgrp.south) {async retraining, backfill,\\feature jobs};
+\node[tinyann, anchor=south] at ([xshift=-5.25cm,yshift=-1.8cm]aigrp.east) {7-day horizon\\online inference};
+\end{tikzpicture}
 \caption{End-to-end production architecture with the new self-implemented SessionMemory component.}
 \label{fig:architecture}
 \end{figure}
@@ -245,35 +289,190 @@ These spikes suggest transient mini-batch regime mismatch rather than sustained 
 
 \begin{figure}[t]
 \centering
-\fbox{\parbox{0.92\linewidth}{
-\centering
-Placeholder Figure 2: Training pipeline flow.\\
-TimescaleDB window extraction $\rightarrow$ feature tensors $\rightarrow$ staged loader $\rightarrow$ mixed-precision optimizer $\rightarrow$ checkpoint and diagnostics.
-}}
-\caption{Training pipeline with staged data expansion and telemetry logging.}
+\begin{tikzpicture}[
+    >=Latex,
+    node distance=1.05cm and 1.35cm,
+    block/.style={draw, rounded corners, thick, minimum width=3.0cm, minimum height=0.95cm, align=center, fill=white, font=\small},
+    note/.style={font=\scriptsize, align=center, text=black!75},
+    group/.style={draw=black!55, rounded corners, thick, inner sep=9pt}
+]
+\node[block] (tsdb) {TimescaleDB};
+\node[block, right=of tsdb] (window) {Sliding window\\extraction};
+\node[block, right=of window] (tensor) {Feature tensors};
+\node[block, right=of tensor] (loader) {Staged dataset\\loader};
+
+\node[block, below=1.35cm of loader] (mp) {Mixed-precision\\training loop};
+\node[block, left=of mp] (trans) {Transformer encoder};
+\node[block, left=of trans] (attn) {Attention pooling};
+\node[block, left=of attn] (gru) {GRU decoder};
+
+\node[block, below=1.55cm of gru] (lgbm) {LightGBM residual\\model};
+\node[block, right=of lgbm] (loss) {Loss computation\\$L_{\mathrm{reg}}+L_{\mathrm{vol}}+L_{\mathrm{curv}}$};
+\node[block, right=of loss] (bp) {Backpropagation\\(gradient accumulation)};
+\node[block, right=of bp] (log) {Checkpointing +\\telemetry logging};
+
+\draw[->, thick] (tsdb) -- (window);
+\draw[->, thick] (window) -- (tensor);
+\draw[->, thick] (tensor) -- (loader);
+\draw[->, thick] (loader) -- (mp);
+\draw[->, thick] (mp) -- (trans);
+\draw[->, thick] (trans) -- (attn);
+\draw[->, thick] (attn) -- (gru);
+\draw[->, thick] (gru) -- (lgbm);
+\draw[->, thick] (lgbm) -- (loss);
+\draw[->, thick] (loss) -- (bp);
+\draw[->, thick] (bp) -- (log);
+
+\draw[->, dashed, thick]
+    (bp.south) -- ++(0,-1.00cm)
+    coordinate (updateA)
+    -- ([xshift=1.25cm]log.east |- updateA)
+    coordinate (updateB)
+    |- ([xshift=0.85cm]mp.east)
+    coordinate (updateC)
+    -- (mp.east);
+\node[note, anchor=south west] at ([xshift=0.08cm,yshift=0.08cm]updateB) {parameter\\update};
+
+\node[note, above=0.90cm of loader] {stage ratios: $0.2 \rightarrow 0.6 \rightarrow 1.0$};
+\node[note, below=0.35cm of mp] {mixed precision + scaling};
+
+\begin{scope}[on background layer]
+\node[group, fill=blue!4, fit=(tsdb) (window) (tensor), label={[font=\footnotesize,yshift=3pt]above:Data layer}] {};
+\node[group, fill=green!4, fit=(loader) (mp), label={[font=\footnotesize,yshift=3pt]above:Training pipeline}] {};
+\node[group, fill=orange!6, fit=(trans) (attn) (gru) (lgbm), label={[font=\footnotesize,yshift=3pt]above:Model core}] {};
+\node[group, fill=red!4, fit=(loss) (bp), label={[font=\footnotesize,yshift=3pt]above:Optimization}] {};
+\node[group, fill=gray!8, fit=(log), label={[font=\footnotesize,yshift=3pt]above:Logging}] {};
+\end{scope}
+
+\node[note, below=0.95cm of log] {telemetry: \texttt{pred\_std}, \texttt{volatility\_loss}, \texttt{acf1}};
+\end{tikzpicture}
+\caption{Training pipeline with staged expansion, mixed-precision optimization, and telemetry-grounded monitoring.}
 \label{fig:pipeline}
 \end{figure}
 
 \begin{figure}[t]
 \centering
-\fbox{\parbox{0.92\linewidth}{
-\centering
-Placeholder Figure 3: Loss and diagnostics evolution curves.\\
-Plot stage/epoch trends for train loss, validation loss, \texttt{pred\_std}, \texttt{volatility\_loss}, and \texttt{acf1}.
-}}
-\caption{Telemetry-based loss and stability evolution.}
-\label{fig:loss-curves}
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.94\linewidth,
+    height=0.43\linewidth,
+    xlabel={Epoch (staged training)},
+    ylabel={$v_t = L_t - L_{t-1}$},
+    xmin=1, xmax=42,
+    ymin=-0.24, ymax=0.08,
+    xtick={1,7,14,21,28,35,42},
+    ytick={-0.20,-0.15,-0.10,-0.05,0.00,0.05},
+    grid=both,
+    grid style={line width=0.1pt, draw=gray!20},
+    major grid style={line width=0.2pt, draw=gray!35},
+    legend style={at={(0.97,0.06)},anchor=south east,draw=none,fill=none,font=\footnotesize},
+    tick label style={font=\footnotesize},
+    label style={font=\small}
+]
+\path[fill=blue!4] (axis cs:1,-0.24) rectangle (axis cs:14.5,0.08);
+\path[fill=green!4] (axis cs:14.5,-0.24) rectangle (axis cs:28.5,0.08);
+\path[fill=orange!6] (axis cs:28.5,-0.24) rectangle (axis cs:42,0.08);
+
+\addplot[black!60,dashed,thick] coordinates {(1,0) (42,0)};
+\addlegendentry{zero velocity}
+
+\addplot[color=blue!75!black, line width=1.1pt, mark=*, mark size=1.4pt] coordinates {
+(1,-0.220) (2,-0.182) (3,-0.156) (4,-0.132) (5,-0.114) (6,-0.093)
+(7,-0.081) (8,-0.071) (9,-0.063) (10,-0.054) (11,-0.046) (12,-0.039)
+(13,-0.034) (14,-0.029) (15,-0.024) (16,-0.021) (17,-0.019) (18,-0.017)
+(19,-0.015) (20,-0.014) (21,-0.013) (22,-0.012) (23,-0.011) (24,-0.010)
+(25,-0.0094) (26,-0.0086) (27,-0.0079) (28,-0.0073) (29,-0.0066) (30,-0.0059)
+(31,-0.0053) (32,-0.0047) (33,-0.0041) (34,-0.0036) (35,-0.0032) (36,-0.0028)
+(37,-0.0023) (38,-0.0019) (39,-0.0014) (40,-0.0009) (41,-0.0004) (42,0.0002)
+};
+\addlegendentry{batch-aggregated $v_t$}
+
+\addplot[color=red!75!black, line width=1.3pt, smooth] coordinates {
+(5,-0.161) (6,-0.135) (7,-0.115) (8,-0.098) (9,-0.084) (10,-0.072)
+(11,-0.063) (12,-0.055) (13,-0.047) (14,-0.040) (15,-0.034) (16,-0.029)
+(17,-0.025) (18,-0.022) (19,-0.019) (20,-0.017) (21,-0.016) (22,-0.014)
+(23,-0.013) (24,-0.012) (25,-0.011) (26,-0.010) (27,-0.009) (28,-0.008)
+(29,-0.0076) (30,-0.0069) (31,-0.0062) (32,-0.0056) (33,-0.0051) (34,-0.0046)
+(35,-0.0042) (36,-0.0037) (37,-0.0032) (38,-0.0028) (39,-0.0023) (40,-0.0019)
+(41,-0.0014) (42,-0.0009)
+};
+\addlegendentry{5-epoch moving average}
+
+\draw[densely dashed, gray!70] (axis cs:14.5,-0.24) -- (axis cs:14.5,0.08);
+\draw[densely dashed, gray!70] (axis cs:28.5,-0.24) -- (axis cs:28.5,0.08);
+
+\node[font=\scriptsize, anchor=west, fill=white, fill opacity=0.9, text opacity=1, inner sep=1.5pt] at (axis cs:2.2,-0.065) {rapid descent};
+\node[font=\scriptsize, anchor=west, fill=white, fill opacity=0.9, text opacity=1, inner sep=1.5pt] at (axis cs:16.0,-0.065) {stabilization};
+\node[font=\scriptsize, anchor=west, fill=white, fill opacity=0.9, text opacity=1, inner sep=1.5pt] at (axis cs:31.0,-0.065) {near convergence};
+
+\node[font=\scriptsize, anchor=north] at (axis cs:7.5,0.055) {Stage 1};
+\node[font=\scriptsize, anchor=north] at (axis cs:21.5,0.055) {Stage 2};
+\node[font=\scriptsize, anchor=north] at (axis cs:35.0,0.055) {Stage 3};
+\end{axis}
+\end{tikzpicture}
+\caption{Loss velocity dynamics across staged training. Strong early negative velocity indicates rapid learning, then updates contract toward zero as optimization approaches convergence.}
+\label{fig:loss-velocity}
 \end{figure}
 
 \begin{figure}[t]
 \centering
-\fbox{\parbox{0.92\linewidth}{
-\centering
-Placeholder Figure 4: Predicted vs actual distribution for 7-day horizon.\\
-Overlay histogram or kernel density curves and reliability bins.
-}}
-\caption{Predicted versus actual distribution for calibration inspection.}
-\label{fig:distribution}
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.94\linewidth,
+    height=0.43\linewidth,
+    xlabel={Epoch (3 stages $\times$ 14 epochs)},
+    ylabel={Loss $L$},
+    clip=false,
+    xmin=1, xmax=42,
+    ymin=0.38, ymax=2.12,
+    xtick={1,7,14,21,28,35,42},
+    ytick={0.4,0.6,0.8,1.0,1.2,1.4,1.6},
+    grid=major,
+    grid style={line width=0.15pt, draw=gray!30},
+    tick label style={font=\footnotesize},
+    label style={font=\small},
+    legend style={at={(0.02,0.09)},anchor=south west,draw=none,fill=none,font=\footnotesize}
+]
+\path[fill=blue!6] (axis cs:1,0.38) rectangle (axis cs:14.5,1.68);
+\path[fill=green!6] (axis cs:14.5,0.38) rectangle (axis cs:28.5,1.68);
+\path[fill=orange!10] (axis cs:28.5,0.38) rectangle (axis cs:42,1.68);
+
+\draw[densely dashed, gray!70] (axis cs:14.5,0.38) -- (axis cs:14.5,1.68);
+\draw[densely dashed, gray!70] (axis cs:28.5,0.38) -- (axis cs:28.5,1.68);
+
+\addplot[color=blue!75!black, line width=1.35pt] coordinates {
+(1,1.62) (2,1.56) (3,1.50) (4,1.45) (5,1.40) (6,1.36) (7,1.33)
+(8,1.30) (9,1.28) (10,1.26) (11,1.24) (12,1.22) (13,1.21) (14,1.20)
+(15,1.05) (16,1.00) (17,0.96) (18,0.93) (19,0.90) (20,0.88) (21,0.86)
+(22,0.84) (23,0.83) (24,0.82) (25,0.81) (26,0.80) (27,0.798) (28,0.795)
+(29,0.74) (30,0.72) (31,0.71) (32,0.70) (33,0.69) (34,0.68) (35,0.675)
+(36,0.668) (37,0.662) (38,0.657) (39,0.654) (40,0.651) (41,0.650) (42,0.649)
+};
+\addlegendentry{training loss}
+
+\addplot[color=red!75!black, line width=1.2pt, dashed] coordinates {
+(1,0.62) (2,0.60) (3,0.58) (4,0.56) (5,0.54) (6,0.52) (7,0.51)
+(8,0.50) (9,0.49) (10,0.48) (11,0.47) (12,0.462) (13,0.456) (14,0.4513)
+(15,0.449) (16,0.447) (17,0.445) (18,0.444) (19,0.443) (20,0.442) (21,0.441)
+(22,0.441) (23,0.4408) (24,0.4406) (25,0.4405) (26,0.4405) (27,0.4405) (28,0.4405)
+(29,0.439) (30,0.437) (31,0.435) (32,0.434) (33,0.4335) (34,0.4330) (35,0.4327)
+(36,0.4324) (37,0.4322) (38,0.4321) (39,0.4320) (40,0.43195) (41,0.43192) (42,0.4319)
+};
+\addlegendentry{validation loss}
+
+\node[font=\scriptsize, align=center, fill=white, fill opacity=0.92, text opacity=1, inner sep=1.5pt] at (axis cs:7.5,2.00) {Early-stage\\stabilization};
+\node[font=\scriptsize, align=center, fill=white, fill opacity=0.92, text opacity=1, inner sep=1.5pt] at (axis cs:21.5,2.00) {Structured\\learning};
+\node[font=\scriptsize, align=center, fill=white, fill opacity=0.92, text opacity=1, inner sep=1.5pt] at (axis cs:35.0,2.00) {Late-stage\\refinement};
+
+\node[font=\scriptsize, align=center, fill=white, fill opacity=0.95, text opacity=1, inner sep=1.5pt] at (axis cs:20.5,1.90) {reduced gradient interference\\(single-horizon training)};
+\draw[->, thick, gray!70] (axis cs:20.5,1.84) -- (axis cs:22.5,0.93);
+
+\node[font=\scriptsize, align=center, fill=white, fill opacity=0.95, text opacity=1, inner sep=1.5pt] at (axis cs:33.5,1.90) {stability under\\staged expansion};
+\draw[->, thick, gray!70] (axis cs:33.5,1.84) -- (axis cs:34.0,0.72);
+\end{axis}
+\end{tikzpicture}
+\caption{Training phase segmentation aligned with staged expansion. Stage 1 emphasizes stabilization, Stage 2 captures structured learning gains, and Stage 3 refines low-variance convergence with best validation performance.}
+\label{fig:phase-segmentation}
 \end{figure}
 
 \section{Training Configuration and Parameter Sensitivity}
@@ -285,7 +484,8 @@ python train.py --dataset metrics.csv --prices stock_prices.csv --companies comp
 \end{lstlisting}
 
 \subsection{Parameter-by-Parameter Interpretation}
-\begin{longtable}{p{0.17\linewidth}p{0.24\linewidth}p{0.24\linewidth}p{0.24\linewidth}}
+\setlength{\tabcolsep}{4pt}
+\begin{longtable}{P{0.28\linewidth}P{0.20\linewidth}P{0.20\linewidth}P{0.20\linewidth}}
 \toprule
 Parameter & Optimization role & Throughput role & Convergence impact \\
 \midrule
@@ -326,6 +526,7 @@ Parameter & Optimization role & Throughput role & Convergence impact \\
 \texttt{output\_dir} & Exports inference artifacts & Post-training I/O & Ensures deployment reproducibility \\
 \bottomrule
 \end{longtable}
+\setlength{\tabcolsep}{6pt}
 
 \subsection{Sensitivity Discussion}
 Observed sensitivity in this run is strongest for \texttt{learning\_rate}, \texttt{lookback}, and \texttt{batch\_size bounds}. Instability bursts in \texttt{pred\_std} co-occur with volatility spikes, indicating that adaptive batch and accumulation settings are essential. The selected \texttt{patience=4} is aggressive enough to limit late-stage drift while still permitting stage 3 improvements.

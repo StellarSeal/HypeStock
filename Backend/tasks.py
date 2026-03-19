@@ -7,6 +7,7 @@ from models import build_envelope
 # --- CONFIGURATION ---
 # Target the updated Redis port schema for message brokering
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:26379/0")
+AI_CHAT_TASK_RATE_LIMIT = os.environ.get("AI_CHAT_TASK_RATE_LIMIT", "20/m")
 
 # Initialize the Celery Application
 celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
@@ -16,7 +17,7 @@ celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
 # through Redis, which the FastAPI ASGI server will pick up and send to clients.
 socket_manager = socketio.RedisManager(REDIS_URL)
 
-@celery_app.task(name="tasks.process_ai_chat")
+@celery_app.task(name="tasks.process_ai_chat", rate_limit=AI_CHAT_TASK_RATE_LIMIT)
 def process_ai_chat(sid: str, request_id: str, content: str, seed: int, context: str):
     """
     Processes natural language queries asynchronously.

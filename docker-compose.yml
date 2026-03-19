@@ -1,9 +1,6 @@
 # We define a common configuration block here using an extension field (x-app-common)
 # and a YAML anchor (&app-common). We can inject this into multiple services.
 x-app-common: &app-common
-  build:
-    context: .
-    dockerfile: Dockerfile
   depends_on:
     db:
       condition: service_healthy
@@ -53,6 +50,10 @@ services:
   backend:
     <<: *app-common # This injects all the properties from x-app-common
     container_name: hypestock-backend
+    image: hypestock-python-app:local
+    build:
+      context: .
+      dockerfile: Dockerfile
     # Removed host port mapping to avoid conflicts with frontend. 
     # Nginx will securely route traffic to it internally on port 12000.
     expose:
@@ -62,8 +63,9 @@ services:
   celery_worker:
     <<: *app-common # This injects all the properties from x-app-common
     container_name: hypestock-worker
+    image: hypestock-python-app:local
     # Command overrides the default CMD in the Dockerfile to boot Celery instead
-    command: celery -A tasks:celery_app worker --loglevel=info
+    command: celery -A tasks:celery_app worker --loglevel=info --concurrency=1 --prefetch-multiplier=1 -Ofair
 
   # 6. Frontend UI (Now acting as the Nginx API Gateway)
   frontend:

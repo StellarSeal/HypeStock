@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # Use the explicitly requested Python version
 FROM python:3.11.7-slim
 

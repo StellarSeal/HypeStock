@@ -447,7 +447,7 @@ function sendAIMessage(content) {
             removeTypingIndicator();
             addMessage("No response from server.", false);
         }
-    }, 60000); 
+    }, 300000); 
     
     pendingAIRequests.set(seed, { timeoutId });
     socket.emit('ai', payload);
@@ -768,7 +768,7 @@ window.ChatUI = {
                 removeTypingIndicator();
                 addMessage("No response from server.", false);
             }
-        }, 60000); 
+        }, 300000); 
         
         pendingAIRequests.set(seed, { timeoutId, onResponse });
         socket.emit('ai', payload);
